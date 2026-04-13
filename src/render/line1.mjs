@@ -49,6 +49,20 @@ const TIER_COLORS = {
 // ---------------------------------------------------------------------------
 
 /**
+ * Format raw model ID into a human-readable display name.
+ * e.g. 'claude-opus-4-6' -> 'Opus 4.6', 'claude-sonnet-4-5' -> 'Sonnet 4.5'
+ */
+function formatModelDisplay(raw) {
+  const m = raw.match(/(opus|sonnet|haiku)[- ]?(\d+)[.-](\d+)/i);
+  if (m) {
+    const name = m[1].charAt(0).toUpperCase() + m[1].slice(1).toLowerCase();
+    const ctx = /\[?1m\]?/i.test(raw) ? ' [1M]' : '';
+    return `${name} ${m[2]}.${m[3]}${ctx}`;
+  }
+  return raw;
+}
+
+/**
  * Model identity segment: icon + model name, colored by tier.
  * @param {object} ctx
  * @returns {string}
@@ -56,7 +70,7 @@ const TIER_COLORS = {
 function modelSegment(ctx) {
   const icon = getIcon('claude');
   const color = TIER_COLORS[ctx.modelTier] || 81;
-  return bold(fg256(color, `${icon} ${ctx.model}`));
+  return bold(fg256(color, `${icon} ${formatModelDisplay(ctx.model)}`));
 }
 
 /**
