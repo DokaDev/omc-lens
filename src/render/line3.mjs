@@ -167,6 +167,20 @@ export function renderLine3(ctx) {
     }
   }
 
+  // Cache hit rate & efficiency
+  if (ctx.tokens) {
+    const hr = ctx.tokens.cacheHitRate || 0;
+    const ef = ctx.tokens.cacheEfficiency || 0;
+    const hrColor = hr >= 0.85 ? 46 : hr >= 0.60 ? 226 : hr > 0 ? 196 : 245;
+    const efColor = ef >= 0.85 ? 46 : ef >= 0.60 ? 226 : ef > 0 ? 196 : 245;
+    const cu = ctx.tokens.cacheCumulativeHitRate || 0;
+    const cuColor = cu >= 0.85 ? 46 : cu >= 0.60 ? 226 : cu > 0 ? 196 : 245;
+    const hrPct = (hr * 100).toFixed(0);
+    const efPct = (ef * 100).toFixed(0);
+    const cuPct = (cu * 100).toFixed(0);
+    parts.push(`\x1b[97m⚡hr ${fg256(hrColor, `${hrPct}%`)} \x1b[97mef ${fg256(efColor, `${efPct}%`)} \x1b[97mcu ${fg256(cuColor, `${cuPct}%`)}`);
+  }
+
   // Session summary
   if (ctx.sessionSummary) {
     const label = ctx.sessionSummary.slice(0, 35);

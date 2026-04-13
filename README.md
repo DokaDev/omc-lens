@@ -9,8 +9,9 @@ omc-lens is a visually enhanced statusline HUD for Claude Code, built on top of 
 - **Extended thinking indicator**: visual flag when extended thinking is active
 - **Permission approval alert**: prominent `APPROVE?` badge when a tool permission is pending
 - **CWD and git status**: current directory basename, branch name, staged/modified/untracked counts, ahead/behind indicators
-- **OMC version display**: installed OMC version with update-available arrow indicator; Claude Code version alongside
-- **Worktree and session name**: active worktree and named session shown in Line 1
+- **OMC version display**: installed OMC version; shows `(*newVersion)` when an update is available on GitHub (cached 6-hour fetch)
+- **omc-lens update indicator**: appears in magenta only when a newer omc-lens release exists — hidden otherwise
+- **Worktree**: active worktree shown in Line 1
 - **20-block 256-colour gradient context bar**: cyan-to-red fill with embedded percentage text; `COMPRESS?` and `CRITICAL` warnings at 80 % and 90 %
 - **Token usage**: input, output, session total, and reasoning token counts with compact K/M formatting
 - **Session cost**: cumulative USD cost formatted to four decimal places
@@ -18,6 +19,7 @@ omc-lens is a visually enhanced statusline HUD for Claude Code, built on top of 
 - **Background task count**: live count of active background tasks
 - **Todo progress**: completed/total ratio with first in-progress item label (up to 30 characters)
 - **Vim mode indicator**: INSERT vs NORMAL with distinct colours
+- **Cache hit metrics**: per-request hit rate (`hr`), per-request efficiency (`ef`), and cumulative session hit rate (`cu`) with colour-coded thresholds (green ≥85%, yellow ≥60%, red <60%)
 - **Rate-limit gauges**: per-window usage bars with 14-step colour gradient
 - **Agent tree**: running sub-agents rendered as a box-drawing tree, up to four entries with overflow count
 - **Crash-safe**: any rendering error falls back to a dim one-line message; Claude Code is never interrupted
@@ -86,9 +88,9 @@ To remove the plugin entirely:
 
 1. **Data collection** (`src/data/context.mjs`): `assembleContext()` reads the OMC state bridge (`src/data/omc-bridge.mjs`) to gather model info, token counts, cost, todos, agents, git status, rate-limit windows, and more.
 2. **Rendering pipeline**:
-   - `renderLine1(ctx)` — identity bar (model, CWD, git, OMC version, session)
+   - `renderLine1(ctx)` — identity bar (model with version extraction, CWD, git, OMC version with update check, omc-lens update indicator)
    - `renderLine2(ctx)` — context gradient bar, token/cost/call counters, todos
-   - `renderLine3(ctx)` — vim mode, orchestration flags (ralph/ultrawork/autopilot), rate limits, session summary
+   - `renderLine3(ctx)` — vim mode, orchestration flags (ralph/ultrawork/autopilot), rate limits, cache hit metrics (hr/ef/cu), session summary
    - `renderAgentTree(ctx)` — box-drawing tree of running sub-agents
 3. **Composition** (`src/render/compose.mjs`): `composeOutput()` joins the lines, enforces terminal-width truncation, and appends any active warnings.
 4. **Output**: the composed string is written to `process.stdout` and consumed by Claude Code's statusline renderer.

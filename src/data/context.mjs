@@ -35,6 +35,36 @@ import { readFileSync, statSync, openSync, readSync, closeSync } from 'node:fs';
 const MAX_TASK_TAIL = 512 * 1024;
 
 /**
+ * Parse cumulative cache tokens from transcript JSONL.
+ * Sums cache_read_input_tokens and cache_creation_input_tokens across all
+ * assistant messages to compute a session-wide cumulative hit rate.
+ * @param {string|null} transcriptPath
+ * @returns {{ cuRead: number, cuCreated: number, cuFresh: number, cuHitRate: number }}
+ */
+function parseCumulativeCacheFromTranscript(transcriptPath) {
+  const result = { cuRead: 0, cuCreated: 0, cuFresh: 0, cuHitRate: 0 };
+  if (!transcriptPath) return result;
+  try {
+    const lines = readFileSync(transcriptPath, 'utf8').split('\n');
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      try {
+        const entry = JSON.parse(line);
+        if (entry.type !== 'assistant') continue;
+        const u = entry.message?.usage;
+        if (!u) continue;
+        result.cuRead += u.cache_read_input_tokens || 0;
+        result.cuCreated += u.cache_creation_input_tokens || 0;
+        result.cuFresh += u.input_tokens || 0;
+      } catch { /* skip malformed line */ }
+    }
+    const denom = result.cuRead + result.cuCreated + result.cuFresh;
+    result.cuHitRate = denom > 0 ? result.cuRead / denom : 0;
+  } catch { /* file read error — return zeros */ }
+  return result;
+}
+
+/**
  * Parse TaskCreate/TaskUpdate from transcript JSONL to build a task list.
  * Only used as fallback when OMC's TodoWrite-based todos are empty.
  *
@@ -268,13 +298,20 @@ export async function assembleContext(options = {}) {
   const currentUsage = ctxWindow?.current_usage;
   const totalInput = ctxWindow?.total_input_tokens || 0;
   const totalOutput = ctxWindow?.total_output_tokens || 0;
+  const cacheCreate = currentUsage?.cache_creation_input_tokens || 0;
+  const cacheRead = currentUsage?.cache_read_input_tokens || 0;
+  const cacheDenom = cacheRead + cacheCreate + totalInput;
+  const cacheWriteReadSum = cacheRead + cacheCreate;
   const tokens = {
     inputTokens: totalInput,
     outputTokens: totalOutput,
     reasoningTokens: lastRequestTokenUsage?.reasoningTokens || null,
-    cacheCreateTokens: currentUsage?.cache_creation_input_tokens || 0,
-    cacheReadTokens: currentUsage?.cache_read_input_tokens || 0,
-    sessionTotal: (totalInput + totalOutput) || sessionTotalTokens || 0,
+    cacheCreateTokens: cacheCreate,
+    cacheReadTokens: cacheRead,
+    cacheHitRate: cacheDenom > 0 ? cacheRead / cacheDenom : 0,
+    cacheEfficiency: cacheWriteReadSum > 0 ? cacheRead / cacheWriteReadSum : 0,
+    cacheCumulativeHitRate: parseCumulativeCacheFromTranscript(transcriptPath).cuHitRate,
+    sessionTotal: (totalInput + totalOutput + cacheRead + cacheCreate) || sessionTotalTokens || 0,
   };
 
   // ── Cost ───────────────────────────────────────────────────────────────
