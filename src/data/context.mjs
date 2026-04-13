@@ -26,7 +26,7 @@ import {
 
 import { getGitBranch, getGitStatusCounts } from './git.mjs';
 import { calculateSessionCost, getModelTier } from './cost.mjs';
-import { checkOmcVersion } from './version-check.mjs';
+import { checkOmcVersion, checkLensVersion } from './version-check.mjs';
 import { readFileSync, statSync, openSync, readSync, closeSync } from 'node:fs';
 
 // ---------------------------------------------------------------------------
@@ -329,6 +329,16 @@ export async function assembleContext(options = {}) {
   }
   const omcUpdateAvailable = omcVersionCheck.updateAvailable ? omcVersionCheck.remote : null;
 
+  // ── omc-lens Version Check ──────────────────────────────────────────
+  let lensVersionCheck = { local: null, remote: null, updateAvailable: false, error: null };
+  try {
+    lensVersionCheck = await checkLensVersion();
+  } catch {
+    // Non-fatal — use defaults
+  }
+  const lensUpdateAvailable = lensVersionCheck.updateAvailable ? lensVersionCheck.remote : null;
+  const lensVersion = lensVersionCheck.local || null;
+
   // ── Stdin extras (worktree, vim, session name) ────────────────────────
   const worktree = stdin?.worktree?.name || null;
   const vimMode = stdin?.vim?.mode || null;
@@ -369,6 +379,8 @@ export async function assembleContext(options = {}) {
     omcAvailable,
     omcVersionCheck,
     omcUpdateAvailable,
+    lensVersion,
+    lensUpdateAvailable,
     worktree,
     vimMode,
     sessionName,

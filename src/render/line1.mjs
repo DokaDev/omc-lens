@@ -154,6 +154,11 @@ function omcSegment(ctx) {
     }
   }
 
+  // omc-lens update (shown only when update available)
+  if (ctx.lensUpdateAvailable && ctx.lensVersion) {
+    parts.push(fg256(171, `${getIcon('lens')} ${ctx.lensVersion}(*${ctx.lensUpdateAvailable})`));
+  }
+
   return parts.join('  ');
 }
 
@@ -224,7 +229,6 @@ export function renderLine1(ctx) {
   // Group 5: Environment extras (joined by space, not separator)
   // Note: vim mode moved to Line 3 (first element)
   const extras = [
-    sessionSegment(ctx),
   ].filter(Boolean).join(' ');
 
   // Join non-empty groups with separator
