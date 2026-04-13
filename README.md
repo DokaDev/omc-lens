@@ -2,6 +2,8 @@
 
 omc-lens is a visually enhanced statusline HUD for Claude Code, built on top of the OMC (oh-my-claudecode) data bridge. It renders rich session information across three lines using Nerd Font icons and 256-colour ANSI gradient bars. The renderer is registered as a `statusLine` command in Claude Code's `settings.json`, giving you a live, always-visible view of your session state.
 
+![omc-lens statusline](./screenshot.png)
+
 ## Features
 
 - **Three-line layout**: identity bar (Line 1), context/token/cost bar (Line 2), and orchestration/rate-limit bar (Line 3)
