@@ -134,7 +134,7 @@ function omcSegment(ctx) {
   // OMC version
   if (ctx.omcVersion) {
     if (ctx.omcUpdateAvailable) {
-      parts.push(fg256(226, `${getIcon('update')} ${ctx.omcVersion}\u2192${ctx.omcUpdateAvailable}`));
+      parts.push(fg256(81, `${getIcon('omc')} ${ctx.omcVersion}(*${ctx.omcUpdateAvailable})`));
     } else {
       parts.push(fg256(81, `${getIcon('omc')} ${ctx.omcVersion}`));
     }

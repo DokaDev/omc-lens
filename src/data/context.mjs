@@ -26,6 +26,7 @@ import {
 
 import { getGitBranch, getGitStatusCounts } from './git.mjs';
 import { calculateSessionCost, getModelTier } from './cost.mjs';
+import { checkOmcVersion } from './version-check.mjs';
 import { readFileSync, statSync, openSync, readSync, closeSync } from 'node:fs';
 
 // ---------------------------------------------------------------------------
@@ -319,6 +320,15 @@ export async function assembleContext(options = {}) {
   const gitBranch = safeCall(() => getGitBranch(cwd), null);
   const gitStatus = safeCall(() => getGitStatusCounts(cwd), null);
 
+  // ── OMC Version Check ─────────────────────────────────────────────────
+  let omcVersionCheck = { local: null, remote: null, updateAvailable: false, error: null };
+  try {
+    omcVersionCheck = await checkOmcVersion();
+  } catch {
+    // Non-fatal — use defaults
+  }
+  const omcUpdateAvailable = omcVersionCheck.updateAvailable ? omcVersionCheck.remote : null;
+
   // ── Stdin extras (worktree, vim, session name) ────────────────────────
   const worktree = stdin?.worktree?.name || null;
   const vimMode = stdin?.vim?.mode || null;
@@ -357,6 +367,8 @@ export async function assembleContext(options = {}) {
     lastRequestTokenUsage,
     omcVersion,
     omcAvailable,
+    omcVersionCheck,
+    omcUpdateAvailable,
     worktree,
     vimMode,
     sessionName,
