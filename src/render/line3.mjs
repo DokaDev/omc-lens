@@ -178,7 +178,22 @@ export function renderLine3(ctx) {
     const hrPct = (hr * 100).toFixed(0);
     const efPct = (ef * 100).toFixed(0);
     const cuPct = (cu * 100).toFixed(0);
-    parts.push(`\x1b[97m⚡hr ${fg256(hrColor, `${hrPct}%`)} \x1b[97mef ${fg256(efColor, `${efPct}%`)} \x1b[97mcu ${fg256(cuColor, `${cuPct}%`)}`);
+
+    // Per-turn deltas (from Stop hook snapshot)
+    const prevHr = ctx.tokens.prevCacheHitRate;
+    const prevEf = ctx.tokens.prevCacheEfficiency;
+    let hrDelta = '';
+    let efDelta = '';
+    if (prevHr !== null && prevHr !== undefined) {
+      const d = Math.round((hr - prevHr) * 100);
+      if (d !== 0) hrDelta = fg256(d > 0 ? 46 : 196, `(${d > 0 ? '+' : ''}${d})`);
+    }
+    if (prevEf !== null && prevEf !== undefined) {
+      const d = Math.round((ef - prevEf) * 100);
+      if (d !== 0) efDelta = fg256(d > 0 ? 46 : 196, `(${d > 0 ? '+' : ''}${d})`);
+    }
+
+    parts.push(`${fg256(171, getIcon('cache'))}hr ${fg256(hrColor, `${hrPct}%`)}${hrDelta} \x1b[97mef ${fg256(efColor, `${efPct}%`)}${efDelta} \x1b[97mcu ${fg256(cuColor, `${cuPct}%`)}`);
   }
 
   // Session summary

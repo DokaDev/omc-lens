@@ -27,7 +27,34 @@ import {
 import { getGitBranch, getGitStatusCounts } from './git.mjs';
 import { calculateSessionCost, getModelTier } from './cost.mjs';
 import { checkOmcVersion, checkLensVersion } from './version-check.mjs';
-import { readFileSync, statSync, openSync, readSync, closeSync } from 'node:fs';
+import { readFileSync, statSync, openSync, readSync, closeSync, existsSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+
+// ---------------------------------------------------------------------------
+// Cache snapshot reader (reads Stop-hook snapshot for per-turn deltas)
+// ---------------------------------------------------------------------------
+
+/**
+ * Read the cache snapshot saved by the Stop hook and compute deltas.
+ * Returns fields to spread into the tokens object.
+ * @param {string|null} sessionId
+ * @returns {{ prevCacheHitRate: number|null, prevCacheEfficiency: number|null }}
+ */
+function readCacheSnapshot(sessionId) {
+  const empty = { prevCacheHitRate: null, prevCacheEfficiency: null };
+  if (!sessionId) return empty;
+  try {
+    const p = join(tmpdir(), `omc-lens-cache-snapshot-${sessionId}.json`);
+    if (!existsSync(p)) return empty;
+    const data = JSON.parse(readFileSync(p, 'utf8'));
+    return {
+      prevCacheHitRate: typeof data.hr === 'number' ? data.hr : null,
+      prevCacheEfficiency: typeof data.ef === 'number' ? data.ef : null,
+    };
+  } catch {
+    return empty;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // TaskCreate/TaskUpdate parser (fallback when OMC TodoWrite is empty)
@@ -311,6 +338,7 @@ export async function assembleContext(options = {}) {
     cacheHitRate: cacheDenom > 0 ? cacheRead / cacheDenom : 0,
     cacheEfficiency: cacheWriteReadSum > 0 ? cacheRead / cacheWriteReadSum : 0,
     cacheCumulativeHitRate: parseCumulativeCacheFromTranscript(transcriptPath).cuHitRate,
+    ...readCacheSnapshot(stdin?.session_id),
     sessionTotal: (totalInput + totalOutput + cacheRead + cacheCreate) || sessionTotalTokens || 0,
   };
 

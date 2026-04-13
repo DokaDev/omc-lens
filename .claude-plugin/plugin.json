@@ -1,6 +1,6 @@
 {
   "name": "omc-lens",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "A visually enhanced Claude Code statusline with Nerd Font icons and 256-colour gradient bars, powered by OMC data modules.",
   "author": { "name": "DokaDev" },
   "repository": "https://github.com/DokaDev/omc-lens",
@@ -15,5 +15,18 @@
   ],
   "engine": {
     "claude-code": ">=1.0.0"
+  },
+  "hooks": {
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ${CLAUDE_PLUGIN_ROOT}/hooks/cache-snapshot.mjs"
+          }
+        ]
+      }
+    ]
   }
 }
