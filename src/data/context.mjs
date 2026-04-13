@@ -27,7 +27,8 @@ import {
 import { getGitBranch, getGitStatusCounts } from './git.mjs';
 import { calculateSessionCost, getModelTier } from './cost.mjs';
 import { checkOmcVersion, checkLensVersion } from './version-check.mjs';
-import { readFileSync, statSync, openSync, readSync, closeSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, statSync, openSync, readSync, closeSync, existsSync } from 'node:fs';
+import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
 // ---------------------------------------------------------------------------
@@ -370,15 +371,43 @@ export async function assembleContext(options = {}) {
   // Combined: running agents + OMC background (deduplicated via max)
   const activeTaskCount = Math.max(runningAgentCount, omcBackgroundCount);
 
-  // ── Rate Limits ────────────────────────────────────────────────────────
+  // ── Rate Limits (throttled fetch + file-based cache) ───────────────────
+  // The usage API has its own rate limit — calling it every ~300ms render
+  // cycle quickly exhausts it. Only fetch when cache is stale (>60s).
   let rateLimits = null;
   let rateLimitError = undefined;
+  const _rlCachePath = join(tmpdir(), `omc-lens-ratelimit-cache-${stdin?.session_id || 'default'}.json`);
+  const _rlCacheTtlMs = 60 * 1000; // 60 seconds
+  let _rlCacheHit = false;
   try {
-    const usageResult = await getUsage();
-    rateLimits = usageResult.rateLimits || null;
-    rateLimitError = usageResult.error || undefined;
-  } catch {
-    rateLimitError = 'fetch_error';
+    if (existsSync(_rlCachePath)) {
+      const _rlStat = statSync(_rlCachePath);
+      const _rlAge = Date.now() - _rlStat.mtimeMs;
+      if (_rlAge < _rlCacheTtlMs) {
+        rateLimits = JSON.parse(readFileSync(_rlCachePath, 'utf8'));
+        _rlCacheHit = true;
+      }
+    }
+  } catch {}
+  if (!_rlCacheHit) {
+    try {
+      const usageResult = await getUsage();
+      rateLimits = usageResult.rateLimits || null;
+      rateLimitError = usageResult.error || undefined;
+      if (rateLimits) {
+        try { writeFileSync(_rlCachePath, JSON.stringify(rateLimits), 'utf8'); } catch {}
+      }
+    } catch {
+      rateLimitError = 'fetch_error';
+    }
+    // Fallback: read stale cache if fetch failed
+    if (!rateLimits) {
+      try {
+        if (existsSync(_rlCachePath)) {
+          rateLimits = JSON.parse(readFileSync(_rlCachePath, 'utf8'));
+        }
+      } catch {}
+    }
   }
 
   // ── Git ────────────────────────────────────────────────────────────────

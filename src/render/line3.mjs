@@ -193,7 +193,7 @@ export function renderLine3(ctx) {
       if (d !== 0) efDelta = fg256(d > 0 ? 46 : 196, `(${d > 0 ? '+' : ''}${d})`);
     }
 
-    parts.push(`${fg256(171, getIcon('cache'))}hr ${fg256(hrColor, `${hrPct}%`)}${hrDelta} \x1b[97mef ${fg256(efColor, `${efPct}%`)}${efDelta} \x1b[97mcu ${fg256(cuColor, `${cuPct}%`)}`);
+    parts.push(`\x1b[97m${getIcon('cache')}hr ${fg256(hrColor, `${hrPct}%`)}${hrDelta} \x1b[97mef ${fg256(efColor, `${efPct}%`)}${efDelta} \x1b[97mcu ${fg256(cuColor, `${cuPct}%`)}`);
   }
 
   // Session summary
