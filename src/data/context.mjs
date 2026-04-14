@@ -330,6 +330,11 @@ export async function assembleContext(options = {}) {
   const cacheRead = currentUsage?.cache_read_input_tokens || 0;
   const cacheDenom = cacheRead + cacheCreate + totalInput;
   const cacheWriteReadSum = cacheRead + cacheCreate;
+  // Cumulative cache totals across the full transcript — required so that
+  // cost and sessionTotal align in units with totalInput/totalOutput
+  // (which are already session-cumulative). current_usage is a per-request
+  // snapshot and must not be fed into a cumulative cost formula.
+  const cumulativeCache = parseCumulativeCacheFromTranscript(transcriptPath);
   const tokens = {
     inputTokens: totalInput,
     outputTokens: totalOutput,
@@ -338,13 +343,23 @@ export async function assembleContext(options = {}) {
     cacheReadTokens: cacheRead,
     cacheHitRate: cacheDenom > 0 ? cacheRead / cacheDenom : 0,
     cacheEfficiency: cacheWriteReadSum > 0 ? cacheRead / cacheWriteReadSum : 0,
-    cacheCumulativeHitRate: parseCumulativeCacheFromTranscript(transcriptPath).cuHitRate,
+    cacheCumulativeHitRate: cumulativeCache.cuHitRate,
     ...readCacheSnapshot(stdin?.session_id),
-    sessionTotal: (totalInput + totalOutput + cacheRead + cacheCreate) || sessionTotalTokens || 0,
+    sessionTotal:
+      (totalInput + totalOutput + cumulativeCache.cuRead + cumulativeCache.cuCreated)
+      || sessionTotalTokens
+      || 0,
   };
 
   // ── Cost ───────────────────────────────────────────────────────────────
-  const cost = calculateSessionCost(model, tokens);
+  // Use cumulative cache totals so every term in the cost formula is in the
+  // same "session cumulative" unit as inputTokens/outputTokens.
+  const cost = calculateSessionCost(model, {
+    inputTokens: totalInput,
+    outputTokens: totalOutput,
+    cacheCreateTokens: cumulativeCache.cuCreated,
+    cacheReadTokens: cumulativeCache.cuRead,
+  });
 
   // ── OMC Orchestration State ────────────────────────────────────────────
   const ralph = safeCall(() => readRalphStateForHud(cwd), null);
