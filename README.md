@@ -99,6 +99,8 @@ To remove the plugin entirely:
    - `renderAgentTree(ctx)` — box-drawing tree of running sub-agents
 3. **Composition** (`src/render/compose.mjs`): `composeOutput()` joins the lines, enforces terminal-width truncation, and appends any active warnings.
 4. **Output**: the composed string is written to `process.stdout` and consumed by Claude Code's statusline renderer.
+<img width="374" height="87" alt="update_not" src="https://github.com/user-attachments/assets/24ae53cc-6543-4224-9281-171a958b2384" />
+
 5. **Update check** (`hooks/version-notify.mjs`): on `SessionStart`, queries GitHub for the latest omc-lens and OMC versions (cached 6 hours per target). When an update exists it writes a banner to stdout (consumed by Claude as session context) and fires a native macOS notification via `hooks/lib/show-notification.applescript` — consolidated into a single popup when both have updates, OMC listed first.
 
 ## Configuration
