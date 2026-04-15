@@ -26,6 +26,7 @@ omc-lens is a visually enhanced statusline HUD for Claude Code, built on top of 
 - **Rate-limit gauges**: per-window usage bars with 14-step colour gradient
 - **Agent tree**: running sub-agents rendered as a box-drawing tree, up to four entries with overflow count
 - **Crash-safe**: any rendering error falls back to a dim one-line message; Claude Code is never interrupted
+- **Update notifications**: a `SessionStart` hook checks GitHub every 6 hours for new omc-lens and oh-my-claudecode releases. When an update is available it surfaces a native macOS notification (consolidated into a single popup when both have updates) and injects a parsable banner into Claude's session context
 
 ## Requirements
 
@@ -98,6 +99,7 @@ To remove the plugin entirely:
    - `renderAgentTree(ctx)` — box-drawing tree of running sub-agents
 3. **Composition** (`src/render/compose.mjs`): `composeOutput()` joins the lines, enforces terminal-width truncation, and appends any active warnings.
 4. **Output**: the composed string is written to `process.stdout` and consumed by Claude Code's statusline renderer.
+5. **Update check** (`hooks/version-notify.mjs`): on `SessionStart`, queries GitHub for the latest omc-lens and OMC versions (cached 6 hours per target). When an update exists it writes a banner to stdout (consumed by Claude as session context) and fires a native macOS notification via `hooks/lib/show-notification.applescript` — consolidated into a single popup when both have updates, OMC listed first.
 
 ## Configuration
 
