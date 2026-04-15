@@ -29,3 +29,11 @@ Only if Step 2 passed. Run the install script and report its output:
 ```bash
 bash "<PLUGIN_ROOT>/scripts/install.sh"
 ```
+
+## Step 4 — Offer to clean up old plugin versions
+
+Only if Step 3 succeeded. Invoke the `cleanup-old-versions` skill so the
+user is asked whether to delete inactive omc-lens version directories that
+have piled up in the plugin cache. The skill performs its own user
+confirmation; do not delete anything yourself. If the user declines, that
+is fine — the install is already complete.
