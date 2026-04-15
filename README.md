@@ -26,7 +26,7 @@ omc-lens is a visually enhanced statusline HUD for Claude Code, built on top of 
 - **Rate-limit gauges**: per-window usage bars with 14-step colour gradient
 - **Agent tree**: running sub-agents rendered as a box-drawing tree, up to four entries with overflow count
 - **Crash-safe**: any rendering error falls back to a dim one-line message; Claude Code is never interrupted
-- **Update notifications**: a `SessionStart` hook checks GitHub every 6 hours for new omc-lens and oh-my-claudecode releases. When an update is available it surfaces a native macOS notification (consolidated into a single popup when both have updates) and injects a parsable banner into Claude's session context
+- **Update notifications**: a `SessionStart` hook checks GitHub every 6 hours for new omc-lens and oh-my-claudecode releases. When an update is available it injects a parsable banner into Claude's session context and, **on macOS only**, also surfaces a native notification popup (consolidated into a single popup when both have updates). On other platforms the banner-only path is used.
 
 ## Requirements
 
@@ -101,7 +101,7 @@ To remove the plugin entirely:
 4. **Output**: the composed string is written to `process.stdout` and consumed by Claude Code's statusline renderer.
 <img width="374" height="87" alt="update_not" src="https://github.com/user-attachments/assets/24ae53cc-6543-4224-9281-171a958b2384" />
 
-5. **Update check** (`hooks/version-notify.mjs`): on `SessionStart`, queries GitHub for the latest omc-lens and OMC versions (cached 6 hours per target). When an update exists it writes a banner to stdout (consumed by Claude as session context) and fires a native macOS notification via `hooks/lib/show-notification.applescript` — consolidated into a single popup when both have updates, OMC listed first.
+5. **Update check** (`hooks/version-notify.mjs`): on `SessionStart`, queries GitHub for the latest omc-lens and OMC versions (cached 6 hours per target). When an update exists it writes a banner to stdout (consumed by Claude as session context). **On macOS only**, it additionally fires a native notification via `hooks/lib/show-notification.applescript` — consolidated into a single popup when both have updates, OMC listed first. Non-macOS platforms skip the popup silently and rely on the banner alone.
 
 ## Configuration
 
