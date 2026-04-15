@@ -12,18 +12,17 @@ import { dirname, join } from 'node:path';
 import { execFile } from 'node:child_process';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+const NOTIFY_SCRIPT = join(__dirname, 'lib', 'show-notification.applescript');
 
 /**
- * Fire a native macOS notification. Silent no-op on non-darwin platforms
- * or any failure. AppleScript escaping: wrap the user-supplied strings in
- * double quotes and escape any embedded double quote + backslash.
+ * Fire a native macOS notification via the shared AppleScript helper.
+ * Title and body are passed as argv so no AppleScript string escaping
+ * is required in the caller. Silent no-op on non-darwin or any failure.
  */
 function macNotify(title, body) {
   if (process.platform !== 'darwin') return;
-  const esc = (s) => String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-  const script = `display notification "${esc(body)}" with title "${esc(title)}"`;
   try {
-    execFile('osascript', ['-e', script], () => {});
+    execFile('osascript', [NOTIFY_SCRIPT, title, body], () => {});
   } catch {
     // swallow — never block session start on notification failure
   }
