@@ -67,9 +67,10 @@ Restart Claude Code to activate the HUD. To revert, run `/uninstall-omc-lens`.
 /plugin marketplace update omc-lens
 /plugin update omc-lens@omc-lens
 /reload-plugins
+/install-omc-lens
 ```
 
-Then re-run `/install-omc-lens` if the symlink path has changed.
+The final `/install-omc-lens` is required so that the symlink in `~/.claude/hud/` is re-pointed at the newly installed plugin version directory.
 
 ## Uninstalling
 
