@@ -36,6 +36,20 @@ function rateColor(u) {
 }
 
 /**
+ * 3-tier color for per-turn cache hit rate / efficiency deltas.
+ * Magnitude bands: |d| < 3 = noise, 3-9 = meaningful, >=10 = large.
+ * Positive = improving (green family), negative = regressing (red family).
+ * @param {number} d  Integer percentage delta
+ * @returns {number}  256-color code
+ */
+function deltaColor(d) {
+  const ad = Math.abs(d);
+  if (d > 0) return ad >= 10 ? 46 : ad >= 3 ? 82 : 114;
+  if (d < 0) return ad >= 10 ? 196 : ad >= 3 ? 202 : 131;
+  return 245;
+}
+
+/**
  * Render Line 3: Orchestration and session info.
  *
  * @param {import('../data/context.mjs').RenderContext} ctx
@@ -171,26 +185,28 @@ export function renderLine3(ctx) {
   if (ctx.tokens) {
     const hr = ctx.tokens.cacheHitRate || 0;
     const ef = ctx.tokens.cacheEfficiency || 0;
-    const hrColor = hr >= 0.85 ? 46 : hr >= 0.60 ? 226 : hr > 0 ? 196 : 245;
-    const efColor = ef >= 0.85 ? 46 : ef >= 0.60 ? 226 : ef > 0 ? 196 : 245;
     const cu = ctx.tokens.cacheCumulativeHitRate || 0;
-    const cuColor = cu >= 0.85 ? 46 : cu >= 0.60 ? 226 : cu > 0 ? 196 : 245;
-    const hrPct = (hr * 100).toFixed(0);
-    const efPct = (ef * 100).toFixed(0);
-    const cuPct = (cu * 100).toFixed(0);
+    const hrPct = Math.round(hr * 100);
+    const efPct = Math.round(ef * 100);
+    const cuPct = Math.round(cu * 100);
+    // Reuse rate-limit 14-step gradient, reversed: high hit rate = good (cyan),
+    // low hit rate = bad (red). Zero = no data (gray).
+    const hrColor = hr > 0 ? rateColor(100 - hrPct) : 245;
+    const efColor = ef > 0 ? rateColor(100 - efPct) : 245;
+    const cuColor = cu > 0 ? rateColor(100 - cuPct) : 245;
 
-    // Per-turn deltas (from Stop hook snapshot)
+    // Per-turn deltas (from Stop hook snapshot) — 3-tier magnitude-based color
     const prevHr = ctx.tokens.prevCacheHitRate;
     const prevEf = ctx.tokens.prevCacheEfficiency;
     let hrDelta = '';
     let efDelta = '';
     if (prevHr !== null && prevHr !== undefined) {
       const d = Math.round((hr - prevHr) * 100);
-      if (d !== 0) hrDelta = fg256(d > 0 ? 46 : 196, `(${d > 0 ? '+' : ''}${d})`);
+      if (d !== 0) hrDelta = fg256(deltaColor(d), `(${d > 0 ? '+' : ''}${d})`);
     }
     if (prevEf !== null && prevEf !== undefined) {
       const d = Math.round((ef - prevEf) * 100);
-      if (d !== 0) efDelta = fg256(d > 0 ? 46 : 196, `(${d > 0 ? '+' : ''}${d})`);
+      if (d !== 0) efDelta = fg256(deltaColor(d), `(${d > 0 ? '+' : ''}${d})`);
     }
 
     parts.push(`\x1b[97m${getIcon('cache')}hr ${fg256(hrColor, `${hrPct}%`)}${hrDelta} \x1b[97mef ${fg256(efColor, `${efPct}%`)}${efDelta} \x1b[97mcu ${fg256(cuColor, `${cuPct}%`)}`);

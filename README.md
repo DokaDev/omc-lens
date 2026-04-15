@@ -22,7 +22,7 @@ omc-lens is a visually enhanced statusline HUD for Claude Code, built on top of 
 - **Background task count**: live count of active background tasks
 - **Todo progress**: completed/total ratio with first in-progress item label (up to 30 characters)
 - **Vim mode indicator**: INSERT vs NORMAL with distinct colours
-- **Cache hit metrics**: per-request hit rate (`hr`), per-request efficiency (`ef`), and cumulative session hit rate (`cu`) with colour-coded thresholds (green ≥85%, yellow ≥60%, red <60%)
+- **Cache hit metrics**: per-request hit rate (`hr`), per-request efficiency (`ef`), and cumulative session hit rate (`cu`) with a 14-step colour gradient (cyan = high, red = low) and 3-tier per-turn delta colouring (noise / meaningful / large)
 - **Rate-limit gauges**: per-window usage bars with 14-step colour gradient
 - **Agent tree**: running sub-agents rendered as a box-drawing tree, up to four entries with overflow count
 - **Crash-safe**: any rendering error falls back to a dim one-line message; Claude Code is never interrupted
