@@ -40,7 +40,20 @@ async function main() {
       checkOmcVersion().catch(() => null),
     ]);
 
-    if (lens?.updateAvailable && lens.remote) {
+    const lensAvailable = lens?.updateAvailable && lens.remote;
+    const omcAvailable = omc?.updateAvailable && omc.remote;
+
+    // Stdout banners — OMC first, then omc-lens. Kept separate so Claude
+    // can parse each cleanly from the SessionStart context injection.
+    if (omcAvailable) {
+      process.stdout.write(
+        '\n[OMC UPDATE AVAILABLE]\n\n' +
+        `A new version of oh-my-claudecode is available: v${omc.remote}` +
+        (omc.local ? ` (current: v${omc.local})` : '') +
+        '\n\nTo update, run: omc update\n',
+      );
+    }
+    if (lensAvailable) {
       process.stdout.write(
         '\n[OMC-LENS UPDATE AVAILABLE]\n\n' +
         `A new version of omc-lens is available: v${lens.remote}` +
@@ -50,23 +63,21 @@ async function main() {
         '  /plugin update omc-lens@omc-lens\n' +
         '  /reload-plugins\n',
       );
-      macNotify(
-        'OMC Lens HUD update available',
-        `v${lens.remote}${lens.local ? ` (current v${lens.local})` : ''}`,
-      );
     }
 
-    if (omc?.updateAvailable && omc.remote) {
-      process.stdout.write(
-        '\n[OMC UPDATE AVAILABLE]\n\n' +
-        `A new version of oh-my-claudecode is available: v${omc.remote}` +
-        (omc.local ? ` (current: v${omc.local})` : '') +
-        '\n\nTo update, run: omc update\n',
-      );
+    // Consolidate the macOS notification: one popup when both have updates,
+    // otherwise keep the per-app title so the popup is specific. OMC is
+    // listed first because it is the upstream dependency.
+    const fmt = (v, cur) => `v${v}${cur ? ` (current v${cur})` : ''}`;
+    if (omcAvailable && lensAvailable) {
       macNotify(
-        'OMC update available',
-        `v${omc.remote}${omc.local ? ` (current v${omc.local})` : ''}`,
+        'Updates available',
+        `OMC ${fmt(omc.remote, omc.local)}\nOMC Lens HUD ${fmt(lens.remote, lens.local)}`,
       );
+    } else if (omcAvailable) {
+      macNotify('OMC update available', fmt(omc.remote, omc.local));
+    } else if (lensAvailable) {
+      macNotify('OMC Lens HUD update available', fmt(lens.remote, lens.local));
     }
   } catch {
     // Never block session start
