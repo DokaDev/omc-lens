@@ -9,27 +9,66 @@
 
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import { execFile } from 'node:child_process';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
+/**
+ * Fire a native macOS notification. Silent no-op on non-darwin platforms
+ * or any failure. AppleScript escaping: wrap the user-supplied strings in
+ * double quotes and escape any embedded double quote + backslash.
+ */
+function macNotify(title, body) {
+  if (process.platform !== 'darwin') return;
+  const esc = (s) => String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+  const script = `display notification "${esc(body)}" with title "${esc(title)}"`;
+  try {
+    execFile('osascript', ['-e', script], () => {});
+  } catch {
+    // swallow — never block session start on notification failure
+  }
+}
+
 async function main() {
   try {
-    const { checkLensVersion } = await import(
+    const { checkLensVersion, checkOmcVersion } = await import(
       join(__dirname, '..', 'src', 'data', 'version-check.mjs')
     );
-    const { local, remote, updateAvailable } = await checkLensVersion();
-    if (!updateAvailable || !remote) return;
 
-    const banner =
-      '\n[OMC-LENS UPDATE AVAILABLE]\n\n' +
-      `A new version of omc-lens is available: v${remote}` +
-      (local ? ` (current: v${local})` : '') +
-      '\n\nTo update, run inside Claude Code:\n' +
-      '  /plugin marketplace update omc-lens\n' +
-      '  /plugin update omc-lens@omc-lens\n' +
-      '  /reload-plugins\n';
+    // Run both checks in parallel; each has its own 6-hour cache.
+    const [lens, omc] = await Promise.all([
+      checkLensVersion().catch(() => null),
+      checkOmcVersion().catch(() => null),
+    ]);
 
-    process.stdout.write(banner);
+    if (lens?.updateAvailable && lens.remote) {
+      process.stdout.write(
+        '\n[OMC-LENS UPDATE AVAILABLE]\n\n' +
+        `A new version of omc-lens is available: v${lens.remote}` +
+        (lens.local ? ` (current: v${lens.local})` : '') +
+        '\n\nTo update, run inside Claude Code:\n' +
+        '  /plugin marketplace update omc-lens\n' +
+        '  /plugin update omc-lens@omc-lens\n' +
+        '  /reload-plugins\n',
+      );
+      macNotify(
+        'OMC Lens HUD update available',
+        `v${lens.remote}${lens.local ? ` (current v${lens.local})` : ''}`,
+      );
+    }
+
+    if (omc?.updateAvailable && omc.remote) {
+      process.stdout.write(
+        '\n[OMC UPDATE AVAILABLE]\n\n' +
+        `A new version of oh-my-claudecode is available: v${omc.remote}` +
+        (omc.local ? ` (current: v${omc.local})` : '') +
+        '\n\nTo update, run: omc update\n',
+      );
+      macNotify(
+        'OMC update available',
+        `v${omc.remote}${omc.local ? ` (current v${omc.local})` : ''}`,
+      );
+    }
   } catch {
     // Never block session start
   }
