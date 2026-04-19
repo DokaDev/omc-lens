@@ -8,7 +8,7 @@
  * Requirements: COMP-01, COMP-02, COMP-03, COMP-04
  */
 
-import { RESET, fg256, bold } from '../lib/ansi.mjs';
+import { RESET, fg256, bold, ansiSafeTruncate } from '../lib/ansi.mjs';
 import { stringWidth, truncateToWidth } from '../lib/omc-bridge.mjs';
 
 // ---------------------------------------------------------------------------
@@ -77,8 +77,10 @@ export function composeLine(segments, termWidth) {
   }
 
   // If even the first segment is too wide, hard truncate
+  // [omc-lens #2 sync] Route overflow truncation through ansiSafeTruncate so
+  // mid-escape cuts no longer let the terminal swallow downstream content.
   if (resultWidth > termWidth) {
-    return truncateToWidth(result, termWidth, `...${RESET}`);
+    return ansiSafeTruncate(result, termWidth, '...');
   }
 
   return result;
@@ -98,11 +100,13 @@ export function composeOutput({ lines, agentLines = [], contextPercent = 0, term
   const outputLines = [];
 
   // Add main lines (truncated to terminal width)
+  // [omc-lens #2 sync] Route overflow truncation through ansiSafeTruncate so
+  // mid-escape cuts no longer let the terminal swallow downstream content.
   for (const line of lines) {
     if (line) {
       const w = stringWidth(line);
       if (w > termWidth) {
-        outputLines.push(truncateToWidth(line, termWidth, `...${RESET}`));
+        outputLines.push(ansiSafeTruncate(line, termWidth, '...'));
       } else {
         outputLines.push(line);
       }
