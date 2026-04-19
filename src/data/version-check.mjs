@@ -11,6 +11,7 @@
 import { join } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
 import { readFileSync, writeFileSync, existsSync, readdirSync } from 'node:fs';
+import { parseSemver, compareSemverDesc } from '../lib/semver.mjs';
 
 // ---------------------------------------------------------------------------
 // OMC_PLUGIN_ROOT: resolve local OMC version from env var if set.
@@ -64,16 +65,11 @@ const LENS_CACHE_FILE = join(tmpdir(), 'omc-lens-self-version-check.json');
 function getLocalVersion(cacheDir) {
   try {
     if (!existsSync(cacheDir)) return null;
-    const entries = readdirSync(cacheDir).filter((e) => /^\d+\.\d+\.\d+/.test(e));
+    // [omc-hud v4.12.1 sync] Replace inline numeric sort with parseSemver/compareSemverDesc
+    // so stable versions outrank pre-releases (e.g., 4.12.0 > 4.12.0-rc1).
+    const entries = readdirSync(cacheDir).filter((e) => parseSemver(e) !== null);
     if (entries.length === 0) return null;
-    entries.sort((a, b) => {
-      const pa = a.split('.').map(Number);
-      const pb = b.split('.').map(Number);
-      for (let i = 0; i < 3; i++) {
-        if ((pa[i] || 0) !== (pb[i] || 0)) return (pb[i] || 0) - (pa[i] || 0);
-      }
-      return 0;
-    });
+    entries.sort(compareSemverDesc);
     return entries[0];
   } catch {
     return null;
@@ -81,18 +77,16 @@ function getLocalVersion(cacheDir) {
 }
 
 function compareSemver(a, b) {
-  const parse = (s) => {
-    const m = /^(\d+)\.(\d+)\.(\d+)/.exec(s);
-    if (!m) return null;
-    return [Number(m[1]), Number(m[2]), Number(m[3])];
-  };
-  const pa = parse(a);
-  const pb = parse(b);
+  // [omc-hud v4.12.1 sync] Replace inline numeric sort with parseSemver/compareSemverDesc
+  // so stable versions outrank pre-releases (e.g., 4.12.0 > 4.12.0-rc1).
+  const pa = parseSemver(a);
+  const pb = parseSemver(b);
   if (!pa || !pb) return null;
-  for (let i = 0; i < 3; i++) {
-    if (pa[i] > pb[i]) return 1;
-    if (pa[i] < pb[i]) return -1;
-  }
+  if (pa.major !== pb.major) return pa.major > pb.major ? 1 : -1;
+  if (pa.minor !== pb.minor) return pa.minor > pb.minor ? 1 : -1;
+  if (pa.patch !== pb.patch) return pa.patch > pb.patch ? 1 : -1;
+  // stable > pre-release when comparing remote vs local
+  if (pa.isStable !== pb.isStable) return pa.isStable ? 1 : -1;
   return 0;
 }
 

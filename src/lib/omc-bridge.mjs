@@ -21,6 +21,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { readdirSync, existsSync, readFileSync } from 'node:fs';
+import { compareSemverDesc, parseSemver } from './semver.mjs';
 
 // ---------------------------------------------------------------------------
 // 1. Version Resolution (sync, runs at module load time)
@@ -69,20 +70,14 @@ function resolveOmcDistPath() {
   try {
     if (!existsSync(OMC_CACHE_DIR)) return null;
 
+    // [omc-hud v4.12.1 sync] Replace inline numeric sort with parseSemver/compareSemverDesc
+    // so stable versions outrank pre-releases (e.g., 4.12.0 > 4.12.0-rc1).
     const versions = readdirSync(OMC_CACHE_DIR)
-      .filter((entry) => /^\d+\.\d+\.\d+/.test(entry));
+      .filter((entry) => parseSemver(entry) !== null);
 
     if (versions.length === 0) return null;
 
-    // Numeric semver sort (descending) -- NOT string sort.
-    versions.sort((a, b) => {
-      const pa = a.split('.').map(Number);
-      const pb = b.split('.').map(Number);
-      for (let i = 0; i < 3; i++) {
-        if ((pa[i] || 0) !== (pb[i] || 0)) return (pb[i] || 0) - (pa[i] || 0);
-      }
-      return 0;
-    });
+    versions.sort(compareSemverDesc);
 
     return join(OMC_CACHE_DIR, versions[0], 'dist');
   } catch {
