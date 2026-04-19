@@ -107,6 +107,28 @@ To remove the plugin entirely:
 
 No configuration file is required in this release. Future versions may expose a `~/.claude/omc-lens.json` settings file for colour theme, bar width, and segment visibility toggles.
 
+## Troubleshooting
+
+### Debug logging
+
+If Line 2 or any other segment misbehaves, set `OMC_LENS_DEBUG=1` in the environment before launching Claude Code to re-emit per-segment render errors on `stderr`:
+
+```bash
+OMC_LENS_DEBUG=1 claude
+```
+
+Or add the variable to `~/.claude/settings.json` under the `env` key so it applies only to Claude Code sessions:
+
+```json
+{
+  "env": {
+    "OMC_LENS_DEBUG": "1"
+  }
+}
+```
+
+Unset the variable once you have the trace you need — the flag is intended as a diagnostic switch rather than a default.
+
 ## License
 
 MIT — see [LICENSE](./LICENSE).
