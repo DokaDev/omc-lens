@@ -53,6 +53,16 @@ function resolveOmcDistPath() {
       if (existsSync(envDist)) return envDist;
     }
   } catch {
+    // fall through to marketplace lookup
+  }
+
+  // [omc-hud v4.12.1 sync] Marketplace clone fallback — mirrors omc-hud.mjs L194-205
+  // Purpose: support marketplace-only installs (dist/ is bundled in marketplace clones)
+  try {
+    const configDir = process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude');
+    const marketplaceDist = join(configDir, 'plugins', 'marketplaces', 'omc', 'dist');
+    if (existsSync(marketplaceDist)) return marketplaceDist;
+  } catch {
     // fall through to plugin cache lookup
   }
 

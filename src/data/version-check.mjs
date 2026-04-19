@@ -183,6 +183,30 @@ export async function checkOmcVersion() {
     return { local, remote, updateAvailable: cmp === 1, error };
   }
 
+  // [omc-hud v4.12.1 sync] Marketplace clone fallback — mirrors omc-hud.mjs L194-205
+  // Purpose: support marketplace-only installs (dist/ is bundled in marketplace clones)
+  try {
+    const configDir = process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude');
+    const marketplaceRoot = join(configDir, 'plugins', 'marketplaces', 'omc');
+    const marketplaceDist = join(marketplaceRoot, 'dist');
+    if (existsSync(marketplaceDist)) {
+      const local = getOmcVersionFromPluginRoot(marketplaceRoot);
+      const cached = readCache(OMC_CACHE_FILE);
+      if (cached) {
+        const remote = cached.remote || null;
+        const cmp = local && remote ? compareSemver(remote, local) : null;
+        return { local, remote, updateAvailable: cmp === 1, error: null };
+      }
+      const remote = await fetchRemoteVersion(OMC_REMOTE_URL);
+      const error = remote === null ? 'fetch failed' : null;
+      writeCache(OMC_CACHE_FILE, remote, local);
+      const cmp = local && remote ? compareSemver(remote, local) : null;
+      return { local, remote, updateAvailable: cmp === 1, error };
+    }
+  } catch {
+    // fall through to plugin cache scan
+  }
+
   return checkVersion(OMC_CACHE_DIR, OMC_REMOTE_URL, OMC_CACHE_FILE);
 }
 
