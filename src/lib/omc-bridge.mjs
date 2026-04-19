@@ -382,7 +382,6 @@ function fallbackSliceByWidth(str, startWidth, endWidth) {
 const FALLBACK_MODULE = {
   stringWidth: fallbackStringWidth,
   stripAnsi: fallbackStripAnsi,
-  truncateToWidth: fallbackTruncateToWidth,
   padToWidth: fallbackPadToWidth,
   sliceByWidth: fallbackSliceByWidth,
   getCharWidth: fallbackGetCharWidth,
@@ -567,10 +566,6 @@ export function stripAnsi(str) {
   return _stringWidth.stripAnsi(str);
 }
 
-export function truncateToWidth(str, maxWidth, suffix) {
-  if (_stringWidth === null) throw new Error('Call initBridge() first');
-  return _stringWidth.truncateToWidth(str, maxWidth, suffix);
-}
 
 export function padToWidth(str, targetWidth) {
   if (_stringWidth === null) throw new Error('Call initBridge() first');

@@ -9,7 +9,7 @@
  */
 
 import { RESET, fg256, bold, ansiSafeTruncate } from '../lib/ansi.mjs';
-import { stringWidth, truncateToWidth } from '../lib/omc-bridge.mjs';
+import { stringWidth } from '../lib/omc-bridge.mjs';
 
 // ---------------------------------------------------------------------------
 // Constants
