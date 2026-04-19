@@ -102,6 +102,9 @@ export function composeOutput({ lines, agentLines = [], contextPercent = 0, term
   // Add main lines (truncated to terminal width)
   // [omc-lens #2 sync] Route overflow truncation through ansiSafeTruncate so
   // mid-escape cuts no longer let the terminal swallow downstream content.
+  // [omc-lens #2 sync] Preserve line count even when a line renderer returns
+  // empty — dropping lines here collapses the 3-line statusline layout and
+  // makes downstream lines invisible.
   for (const line of lines) {
     if (line) {
       const w = stringWidth(line);
@@ -110,6 +113,8 @@ export function composeOutput({ lines, agentLines = [], contextPercent = 0, term
       } else {
         outputLines.push(line);
       }
+    } else {
+      outputLines.push('');
     }
   }
 

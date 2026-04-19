@@ -181,7 +181,9 @@ export function renderLine2(ctx) {
 
   const seg6 = trySegment('todos', () => renderTodos(ctx.todos));
 
-  return [seg1, seg2, seg3, seg4, seg5, seg6]
-    .filter(s => s && s.length > 0)
-    .join(` ${SEP} `);
+  // [omc-lens #2 sync] Return a single-character placeholder when every
+  // segment collapsed, so compose never sees an empty string for this line.
+  const segments = [seg1, seg2, seg3, seg4, seg5, seg6].filter(s => s && s.length > 0);
+  if (segments.length === 0) return '\u2014';
+  return segments.join(` ${SEP} `);
 }

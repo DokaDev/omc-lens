@@ -219,6 +219,9 @@ export function renderLine3(ctx) {
     parts.push(`\x1b[90m${getIcon('summary')} ${label}${suffix}\x1b[0m`);
   }
 
+  // [omc-lens #2 sync] Return a single-character placeholder when every
+  // segment collapsed, so compose never sees an empty string for this line.
+  if (parts.length === 0) return vimPrefix || '\u2014';
   return vimPrefix + parts.join(` ${SEP} `);
 }
 
