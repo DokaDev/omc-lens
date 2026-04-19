@@ -37,103 +37,167 @@ const OMC_CACHE_DIR = join(
 );
 
 /**
- * Scan the OMC plugin cache and return the absolute path to the latest
- * version's `dist/` directory.  Returns `null` when OMC is not installed.
+ * Collect every candidate OMC dist path in priority order and return them as
+ * an array.  Callers iterate the list and use the first one that successfully
+ * imports.  Returns an empty array when OMC is not installed anywhere.
  *
- * If the OMC_PLUGIN_ROOT environment variable is set to a non-empty path
- * and that path contains a `dist/` directory, it takes priority over the
- * plugin cache (fallback-entry semantics, matching omc-hud.mjs L99-113).
+ * Candidate order:
+ *   1. OMC_PLUGIN_ROOT/dist               (user-supplied override, highest priority)
+ *   2. marketplace clone dist             (marketplace-only install)
+ *   3. plugin cache versions, newest→oldest via compareSemverDesc
+ *      (stable releases sort ahead of pre-releases, e.g. 4.12.0 > 4.12.0-rc1)
+ *
+ * [omc-hud v4.12.1 sync] Multi-version retry — mirrors omc-hud.mjs L161-189
+ * Purpose: fall back to older OMC builds when the latest fails to import
  */
-function resolveOmcDistPath() {
+function resolveOmcDistPaths() {
+  const candidates = [];
+
+  // 1. OMC_PLUGIN_ROOT override
   // [omc-hud v4.12.1 sync] OMC_PLUGIN_ROOT fallback-entry — mirrors omc-hud.mjs L99-113
   // Purpose: honor user-supplied plugin root as highest-priority resolver, fall through on failure
   try {
     const envRoot = process.env.OMC_PLUGIN_ROOT;
     if (envRoot && envRoot.trim().length > 0) {
       const envDist = join(envRoot.trim(), 'dist');
-      if (existsSync(envDist)) return envDist;
+      if (existsSync(envDist)) candidates.push(envDist);
     }
   } catch {
-    // fall through to marketplace lookup
+    // ignore — continue building candidate list
   }
 
+  // 2. Marketplace clone
   // [omc-hud v4.12.1 sync] Marketplace clone fallback — mirrors omc-hud.mjs L194-205
   // Purpose: support marketplace-only installs (dist/ is bundled in marketplace clones)
   try {
     const configDir = process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude');
     const marketplaceDist = join(configDir, 'plugins', 'marketplaces', 'omc', 'dist');
-    if (existsSync(marketplaceDist)) return marketplaceDist;
+    if (existsSync(marketplaceDist)) candidates.push(marketplaceDist);
   } catch {
-    // fall through to plugin cache lookup
+    // ignore — continue building candidate list
   }
 
+  // 3. Plugin cache — all semver-valid versions, newest first
   try {
-    if (!existsSync(OMC_CACHE_DIR)) return null;
+    if (existsSync(OMC_CACHE_DIR)) {
+      const versions = readdirSync(OMC_CACHE_DIR)
+        .filter((entry) => parseSemver(entry) !== null);
 
-    // [omc-hud v4.12.1 sync] Replace inline numeric sort with parseSemver/compareSemverDesc
-    // so stable versions outrank pre-releases (e.g., 4.12.0 > 4.12.0-rc1).
-    const versions = readdirSync(OMC_CACHE_DIR)
-      .filter((entry) => parseSemver(entry) !== null);
+      versions.sort(compareSemverDesc);
 
-    if (versions.length === 0) return null;
-
-    versions.sort(compareSemverDesc);
-
-    return join(OMC_CACHE_DIR, versions[0], 'dist');
+      for (const v of versions) {
+        candidates.push(join(OMC_CACHE_DIR, v, 'dist'));
+      }
+    }
   } catch {
-    return null;
+    // ignore — return whatever candidates were collected so far
   }
+
+  return candidates;
 }
 
-/** Resolved once at module load. */
-const OMC_DIST = resolveOmcDistPath();
+/**
+ * All candidate dist paths, resolved once at module load.
+ * importOmcModule() walks this list and caches the first winner.
+ */
+const OMC_DIST_CANDIDATES = resolveOmcDistPaths();
 
 // ---------------------------------------------------------------------------
 // 2. Dynamic Import Helper (async)
 // ---------------------------------------------------------------------------
 
 /**
+ * The dist path from which the first successful module import was served.
+ * Cached at module level so subsequent ensureX() calls skip re-discovery.
+ *
+ * [omc-hud v4.12.1 sync] Multi-version retry — mirrors omc-hud.mjs L161-189
+ * Purpose: fall back to older OMC builds when the latest fails to import
+ *
+ * @type {string|null}
+ */
+let _winningDist = null;
+
+/**
  * Dynamically import an OMC dist module by its relative path inside `dist/`.
+ *
+ * Walks OMC_DIST_CANDIDATES in priority order (OMC_PLUGIN_ROOT → marketplace
+ * → cache newest→oldest) until a candidate succeeds.  The winning dist path
+ * is stored in _winningDist so subsequent calls skip re-discovery.
+ *
+ * If _winningDist is already set, only that path is tried (the common fast
+ * path once omc-lens is warmed up).  On failure from the cached path the
+ * function returns null without re-scanning — statusline renders are frequent
+ * and re-scanning every tick would be wasteful.
+ *
+ * [omc-hud v4.12.1 sync] Multi-version retry — mirrors omc-hud.mjs L161-189
+ * Purpose: fall back to older OMC builds when the latest fails to import
  *
  * @param {string} modulePath  e.g. 'utils/string-width.js'
  * @returns {Promise<object|null>}  The module namespace, or null on failure.
  */
 export async function importOmcModule(modulePath) {
-  if (OMC_DIST === null) return null;
-
-  const fullPath = join(OMC_DIST, modulePath);
-
-  try {
-    // CRITICAL: Convert to file:// URL for cross-platform dynamic import.
-    const mod = await import(pathToFileURL(fullPath).href);
-    if (!mod || Object.keys(mod).length === 0) return null;
-    return mod;
-  } catch {
-    return null;
+  // Fast path: winning dist already known — try only that one.
+  if (_winningDist !== null) {
+    const fullPath = join(_winningDist, modulePath);
+    try {
+      // CRITICAL: Convert to file:// URL for cross-platform dynamic import.
+      const mod = await import(pathToFileURL(fullPath).href);
+      if (!mod || Object.keys(mod).length === 0) return null;
+      return mod;
+    } catch {
+      return null;
+    }
   }
+
+  // No candidates at all — OMC not installed.
+  if (OMC_DIST_CANDIDATES.length === 0) return null;
+
+  // Slow path: iterate candidates until one successfully imports the module.
+  // [omc-hud v4.12.1 sync] Multi-version retry — mirrors omc-hud.mjs L161-189
+  // Purpose: fall back to older OMC builds when the latest fails to import
+  for (const distPath of OMC_DIST_CANDIDATES) {
+    const fullPath = join(distPath, modulePath);
+    try {
+      // CRITICAL: Convert to file:// URL for cross-platform dynamic import.
+      const mod = await import(pathToFileURL(fullPath).href);
+      if (!mod || Object.keys(mod).length === 0) continue;
+      // Cache the winning dist path for all subsequent calls.
+      _winningDist = distPath;
+      return mod;
+    } catch {
+      // Try next candidate.
+    }
+  }
+
+  return null;
 }
 
 /**
  * Return the resolved OMC dist path (for external modules to reuse).
+ * Returns the winning dist path once a module has been successfully imported,
+ * or the first candidate before any import has been attempted, or null.
  * @returns {string|null}
  */
 export function getOmcDistPath() {
-  return OMC_DIST;
+  return _winningDist ?? (OMC_DIST_CANDIDATES[0] ?? null);
 }
 
 /**
  * Return the resolved OMC version string (e.g. '4.11.1').
  *
- * When OMC_PLUGIN_ROOT is in use the dist path has no version segment, so we
- * read the version from plugin.json or package.json inside the plugin root.
- * Falls back to parsing the directory name for the standard cache layout.
+ * Uses the winning dist path (post-import) or the first candidate (pre-import)
+ * to derive the version.  When OMC_PLUGIN_ROOT is in use the dist path has no
+ * version segment, so we read the version from plugin.json or package.json
+ * inside the plugin root.  Falls back to parsing the directory name for the
+ * standard cache layout.
  *
  * @returns {string|null}
  */
 export function getOmcVersion() {
-  if (OMC_DIST === null) return null;
+  const distPath = _winningDist ?? (OMC_DIST_CANDIDATES[0] ?? null);
+  if (distPath === null) return null;
 
-  // When OMC_PLUGIN_ROOT is set, OMC_DIST === {OMC_PLUGIN_ROOT}/dist.
+  // When OMC_PLUGIN_ROOT is set, distPath === {OMC_PLUGIN_ROOT}/dist.
   // The parent directory is the plugin root — read the version from metadata.
   const envRoot = process.env.OMC_PLUGIN_ROOT;
   if (envRoot && envRoot.trim().length > 0) {
@@ -160,7 +224,7 @@ export function getOmcVersion() {
   }
 
   // Standard cache layout: .../oh-my-claudecode/4.11.1/dist
-  const parts = OMC_DIST.split('/');
+  const parts = distPath.split('/');
   // The version is the second-to-last segment (before 'dist')
   return parts[parts.length - 2] || null;
 }
