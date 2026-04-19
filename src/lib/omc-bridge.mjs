@@ -18,7 +18,7 @@
  */
 
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { readdirSync, existsSync, readFileSync } from 'node:fs';
 import { compareSemverDesc, parseSemver } from './semver.mjs';
@@ -213,6 +213,32 @@ export function getOmcVersion() {
     }
     try {
       const pkgJsonPath = join(root, 'package.json');
+      if (existsSync(pkgJsonPath)) {
+        const data = JSON.parse(readFileSync(pkgJsonPath, 'utf8'));
+        if (typeof data.version === 'string') return data.version;
+      }
+    } catch {
+      // ignore
+    }
+    return null;
+  }
+
+  // [fix #1] Detect marketplace layout and read version from plugin.json rather
+  // than the path segment — marketplace paths end in /omc/dist (plugin slug),
+  // not /{version}/dist, so the old path-split approach returned "omc".
+  if (distPath.includes('/marketplaces/')) {
+    const marketplaceRoot = dirname(distPath);
+    try {
+      const pluginJsonPath = join(marketplaceRoot, '.claude-plugin', 'plugin.json');
+      if (existsSync(pluginJsonPath)) {
+        const data = JSON.parse(readFileSync(pluginJsonPath, 'utf8'));
+        if (typeof data.version === 'string') return data.version;
+      }
+    } catch {
+      // ignore
+    }
+    try {
+      const pkgJsonPath = join(marketplaceRoot, 'package.json');
       if (existsSync(pkgJsonPath)) {
         const data = JSON.parse(readFileSync(pkgJsonPath, 'utf8'));
         if (typeof data.version === 'string') return data.version;
