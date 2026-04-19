@@ -13,6 +13,36 @@ import { homedir, tmpdir } from 'node:os';
 import { readFileSync, writeFileSync, existsSync, readdirSync } from 'node:fs';
 
 // ---------------------------------------------------------------------------
+// OMC_PLUGIN_ROOT: resolve local OMC version from env var if set.
+// Returns version string from plugin.json / package.json, or null.
+// Matches fallback-entry semantics from omc-hud.mjs L99-113.
+// ---------------------------------------------------------------------------
+
+function getOmcVersionFromPluginRoot(envRoot) {
+  try {
+    const root = envRoot.trim();
+    const pluginJsonPath = join(root, 'plugin.json');
+    if (existsSync(pluginJsonPath)) {
+      const data = JSON.parse(readFileSync(pluginJsonPath, 'utf8'));
+      if (typeof data.version === 'string') return data.version;
+    }
+  } catch {
+    // ignore
+  }
+  try {
+    const root = envRoot.trim();
+    const pkgJsonPath = join(root, 'package.json');
+    if (existsSync(pkgJsonPath)) {
+      const data = JSON.parse(readFileSync(pkgJsonPath, 'utf8'));
+      if (typeof data.version === 'string') return data.version;
+    }
+  } catch {
+    // ignore
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
@@ -133,6 +163,26 @@ async function checkVersion(cacheDir, remoteUrl, cacheFile) {
 // ---------------------------------------------------------------------------
 
 export async function checkOmcVersion() {
+  // [omc-hud v4.12.1 sync] OMC_PLUGIN_ROOT fallback-entry — mirrors omc-hud.mjs L99-113
+  // Purpose: honor user-supplied plugin root as highest-priority resolver, fall through on failure
+  // When OMC_PLUGIN_ROOT is set and non-empty, read version from metadata files
+  // rather than directory names (fallback-entry semantics, omc-hud.mjs L99-113).
+  const envRoot = process.env.OMC_PLUGIN_ROOT;
+  if (envRoot && envRoot.trim().length > 0) {
+    const local = getOmcVersionFromPluginRoot(envRoot);
+    const cached = readCache(OMC_CACHE_FILE);
+    if (cached) {
+      const remote = cached.remote || null;
+      const cmp = local && remote ? compareSemver(remote, local) : null;
+      return { local, remote, updateAvailable: cmp === 1, error: null };
+    }
+    const remote = await fetchRemoteVersion(OMC_REMOTE_URL);
+    const error = remote === null ? 'fetch failed' : null;
+    writeCache(OMC_CACHE_FILE, remote, local);
+    const cmp = local && remote ? compareSemver(remote, local) : null;
+    return { local, remote, updateAvailable: cmp === 1, error };
+  }
+
   return checkVersion(OMC_CACHE_DIR, OMC_REMOTE_URL, OMC_CACHE_FILE);
 }
 

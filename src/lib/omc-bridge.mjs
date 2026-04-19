@@ -20,7 +20,7 @@
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { readdirSync, existsSync } from 'node:fs';
+import { readdirSync, existsSync, readFileSync } from 'node:fs';
 
 // ---------------------------------------------------------------------------
 // 1. Version Resolution (sync, runs at module load time)
@@ -38,8 +38,24 @@ const OMC_CACHE_DIR = join(
 /**
  * Scan the OMC plugin cache and return the absolute path to the latest
  * version's `dist/` directory.  Returns `null` when OMC is not installed.
+ *
+ * If the OMC_PLUGIN_ROOT environment variable is set to a non-empty path
+ * and that path contains a `dist/` directory, it takes priority over the
+ * plugin cache (fallback-entry semantics, matching omc-hud.mjs L99-113).
  */
 function resolveOmcDistPath() {
+  // [omc-hud v4.12.1 sync] OMC_PLUGIN_ROOT fallback-entry — mirrors omc-hud.mjs L99-113
+  // Purpose: honor user-supplied plugin root as highest-priority resolver, fall through on failure
+  try {
+    const envRoot = process.env.OMC_PLUGIN_ROOT;
+    if (envRoot && envRoot.trim().length > 0) {
+      const envDist = join(envRoot.trim(), 'dist');
+      if (existsSync(envDist)) return envDist;
+    }
+  } catch {
+    // fall through to plugin cache lookup
+  }
+
   try {
     if (!existsSync(OMC_CACHE_DIR)) return null;
 
@@ -102,11 +118,43 @@ export function getOmcDistPath() {
 
 /**
  * Return the resolved OMC version string (e.g. '4.11.1').
+ *
+ * When OMC_PLUGIN_ROOT is in use the dist path has no version segment, so we
+ * read the version from plugin.json or package.json inside the plugin root.
+ * Falls back to parsing the directory name for the standard cache layout.
+ *
  * @returns {string|null}
  */
 export function getOmcVersion() {
   if (OMC_DIST === null) return null;
-  // OMC_DIST is like .../oh-my-claudecode/4.11.1/dist
+
+  // When OMC_PLUGIN_ROOT is set, OMC_DIST === {OMC_PLUGIN_ROOT}/dist.
+  // The parent directory is the plugin root — read the version from metadata.
+  const envRoot = process.env.OMC_PLUGIN_ROOT;
+  if (envRoot && envRoot.trim().length > 0) {
+    const root = envRoot.trim();
+    try {
+      const pluginJsonPath = join(root, 'plugin.json');
+      if (existsSync(pluginJsonPath)) {
+        const data = JSON.parse(readFileSync(pluginJsonPath, 'utf8'));
+        if (typeof data.version === 'string') return data.version;
+      }
+    } catch {
+      // ignore
+    }
+    try {
+      const pkgJsonPath = join(root, 'package.json');
+      if (existsSync(pkgJsonPath)) {
+        const data = JSON.parse(readFileSync(pkgJsonPath, 'utf8'));
+        if (typeof data.version === 'string') return data.version;
+      }
+    } catch {
+      // ignore
+    }
+    return null;
+  }
+
+  // Standard cache layout: .../oh-my-claudecode/4.11.1/dist
   const parts = OMC_DIST.split('/');
   // The version is the second-to-last segment (before 'dist')
   return parts[parts.length - 2] || null;
