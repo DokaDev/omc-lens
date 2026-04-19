@@ -320,18 +320,6 @@ function fallbackStringWidth(str) {
   return width;
 }
 
-function _truncateNoSuffix(str, maxWidth) {
-  let width = 0;
-  let result = '';
-  for (const char of str) {
-    const cw = fallbackGetCharWidth(char);
-    if (width + cw > maxWidth) break;
-    result += char;
-    width += cw;
-  }
-  return result;
-}
-
 function fallbackPadToWidth(str, targetWidth, padChar = ' ') {
   const currentWidth = fallbackStringWidth(str);
   if (currentWidth >= targetWidth) return str;
