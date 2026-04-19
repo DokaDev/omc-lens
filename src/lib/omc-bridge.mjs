@@ -320,19 +320,6 @@ function fallbackStringWidth(str) {
   return width;
 }
 
-function fallbackTruncateToWidth(str, maxWidth, suffix = '...') {
-  if (!str || maxWidth <= 0) return '';
-  const strWidth = fallbackStringWidth(str);
-  if (strWidth <= maxWidth) return str;
-
-  const suffixWidth = fallbackStringWidth(suffix);
-  const targetWidth = maxWidth - suffixWidth;
-  if (targetWidth <= 0) {
-    return _truncateNoSuffix(str, maxWidth);
-  }
-  return _truncateNoSuffix(str, targetWidth) + suffix;
-}
-
 function _truncateNoSuffix(str, maxWidth) {
   let width = 0;
   let result = '';
