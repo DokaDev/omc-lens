@@ -7,7 +7,7 @@
  * Requirements: REND3-01 through REND3-09
  */
 
-import { fg256, bold, dim, RESET } from '../lib/ansi.mjs';
+import { fg256 } from '../lib/ansi.mjs';
 import { getIcon } from '../lib/icons.mjs';
 import { formatDuration, formatResetIn } from '../lib/format.mjs';
 import { basename, join } from 'node:path';
