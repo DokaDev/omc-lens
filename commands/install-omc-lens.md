@@ -7,7 +7,7 @@ description: Activate omc-lens statusline HUD
 ## Step 1 — Resolve plugin root
 
 ```bash
-PLUGIN_ROOT="$(find "$HOME/.claude/plugins/cache/omc-lens/omc-lens" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort | tail -1)" && echo "PLUGIN_ROOT=$PLUGIN_ROOT"
+PLUGIN_ROOT="$(find "$HOME/.claude/plugins/cache/omc-lens/omc-lens" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort -V | tail -1)" && echo "PLUGIN_ROOT=$PLUGIN_ROOT"
 ```
 
 If empty, inform the user that omc-lens is not installed and stop.
