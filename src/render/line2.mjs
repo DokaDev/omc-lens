@@ -81,9 +81,17 @@ function renderTodos(todos) {
     return `${fg256(81, icon)} ${fg256(81, '0/0')}`;
   }
 
-  const done = todos.filter(t => t.status === 'completed').length;
-  const inProgress = todos.filter(t => t.status === 'in_progress').length;
-  const total = todos.length;
+  // [omc-lens #2 sync] Filter null and non-object entries before reading
+  // status so malformed transcript tails cannot throw here.
+  const safe = (todos ?? []).filter(t => t && typeof t === 'object');
+
+  if (!safe.length) {
+    return `${fg256(81, icon)} ${fg256(81, '0/0')}`;
+  }
+
+  const done = safe.filter(t => t.status === 'completed').length;
+  const inProgress = safe.filter(t => t.status === 'in_progress').length;
+  const total = safe.length;
 
   // Color: all done = green(114), in_progress > 0 = cyan(81), else yellow(226)
   const colorCode = done === total ? 114 : inProgress > 0 ? 81 : 226;
@@ -91,7 +99,7 @@ function renderTodos(todos) {
   let str = `${fg256(colorCode, icon)} ${fg256(255, `${done}/${total}`)}`;
 
   // Show first in-progress todo label (max 30 chars)
-  const current = todos.find(t => t.status === 'in_progress');
+  const current = safe.find(t => t.status === 'in_progress');
   if (current?.content) {
     const label = current.content.slice(0, 30);
     const suffix = current.content.length > 30 ? '\u2026' : '';
@@ -113,45 +121,67 @@ const SEP = dim('|');
  * @returns {string}  Fully formatted ANSI string
  */
 export function renderLine2(ctx) {
+  // [omc-lens #2 sync] Per-segment try/catch — a single segment's failure
+  // no longer erases downstream Line 2 content. Errors stay silent unless
+  // OMC_LENS_DEBUG=1 is set, in which case they surface on stderr.
+  const debug = process.env.OMC_LENS_DEBUG === '1';
+
+  function trySegment(name, fn) {
+    try {
+      return fn();
+    } catch (err) {
+      if (debug) process.stderr.write(`[omc-lens line2:${name}] ${err.message}\n`);
+      return '';
+    }
+  }
+
   const pct = ctx.contextPercent || 0;
 
-  // Segment 1 — Context bar
-  const bar = buildBar(pct);
-  let pctSuffix = '';
-  if (pct >= 90) {
-    pctSuffix = ` ${bold(fg256(196, 'CRITICAL'))}`;
-  } else if (pct >= 80) {
-    pctSuffix = ` ${fg256(226, 'COMPRESS?')}`;
-  }
-  const seg1 = `${fg256(255, 'CTX')} [${bar}]${pctSuffix}`;
+  const seg1 = trySegment('ctx-bar', () => {
+    const bar = buildBar(pct);
+    let pctSuffix = '';
+    if (pct >= 90) {
+      pctSuffix = ` ${bold(fg256(196, 'CRITICAL'))}`;
+    } else if (pct >= 80) {
+      pctSuffix = ` ${fg256(226, 'COMPRESS?')}`;
+    }
+    return `${fg256(255, 'CTX')} [${bar}]${pctSuffix}`;
+  });
 
-  // Segment 2 — Token usage
-  const tokens = ctx.tokens || {};
-  const inputT = fmtTokens(tokens.inputTokens || 0);
-  const outputT = fmtTokens(tokens.outputTokens || 0);
-  const sessionT = fmtTokens(tokens.sessionTotal || 0);
-  let seg2 = `${fg256(255, getIcon('token'))} ${fg256(81, '\u2193')}${fg256(255, inputT)} ${fg256(171, '\u2191')}${fg256(255, outputT)} ${fg256(114, '\u03A3')}${fg256(255, sessionT)}`;
-  if (tokens.reasoningTokens) {
-    seg2 += ` ${fg256(208, `R${fmtTokens(tokens.reasoningTokens)}`)}`;
-  }
+  const seg2 = trySegment('tokens', () => {
+    const tokens = ctx.tokens || {};
+    const inputT = fmtTokens(tokens.inputTokens || 0);
+    const outputT = fmtTokens(tokens.outputTokens || 0);
+    const sessionT = fmtTokens(tokens.sessionTotal || 0);
+    let s = `${fg256(255, getIcon('token'))} ${fg256(81, '\u2193')}${fg256(255, inputT)} ${fg256(171, '\u2191')}${fg256(255, outputT)} ${fg256(114, '\u03A3')}${fg256(255, sessionT)}`;
+    if (tokens.reasoningTokens) {
+      s += ` ${fg256(208, `R${fmtTokens(tokens.reasoningTokens)}`)}`;
+    }
+    return s;
+  });
 
-  // Segment 3 — Cost
-  const seg3 = `${fg256(226, getIcon('cost'))} ${fg256(255, formatCost(ctx.cost || 0))}`;
+  const seg3 = trySegment('cost', () =>
+    `${fg256(226, getIcon('cost'))} ${fg256(255, formatCost(ctx.cost || 0))}`
+  );
 
-  // Segment 4 — Call counts
-  let seg4 = `${fg256(208, getIcon('wrench'))} ${fg256(255, String(ctx.toolCallCount || 0))}`;
-  seg4 += ` ${fg256(81, getIcon('robot'))} ${fg256(255, String(ctx.agentCallCount || 0))}`;
-  seg4 += ` ${fg256(171, getIcon('flash'))} ${fg256(255, String(ctx.skillCallCount || 0))}`;
-  if (ctx.lastActivatedSkill) {
-    seg4 += ` ${fg256(171, ctx.lastActivatedSkill.name)}`;
-  }
+  const seg4 = trySegment('counters', () => {
+    let s = `${fg256(208, getIcon('wrench'))} ${fg256(255, String(ctx.toolCallCount || 0))}`;
+    s += ` ${fg256(81, getIcon('robot'))} ${fg256(255, String(ctx.agentCallCount || 0))}`;
+    s += ` ${fg256(171, getIcon('flash'))} ${fg256(255, String(ctx.skillCallCount || 0))}`;
+    if (ctx.lastActivatedSkill) {
+      s += ` ${fg256(171, ctx.lastActivatedSkill.name)}`;
+    }
+    return s;
+  });
 
-  // Segment 5 — Background tasks
-  const activeCount = ctx.activeTaskCount || 0;
-  const seg5 = `${fg256(81, getIcon('progress'))} ${fg256(255, String(activeCount))}`;
+  const seg5 = trySegment('background', () => {
+    const activeCount = ctx.activeTaskCount || 0;
+    return `${fg256(81, getIcon('progress'))} ${fg256(255, String(activeCount))}`;
+  });
 
-  // Segment 6 — Todos
-  const seg6 = renderTodos(ctx.todos);
+  const seg6 = trySegment('todos', () => renderTodos(ctx.todos));
 
-  return [seg1, seg2, seg3, seg4, seg5, seg6].join(` ${SEP} `);
+  return [seg1, seg2, seg3, seg4, seg5, seg6]
+    .filter(s => s && s.length > 0)
+    .join(` ${SEP} `);
 }
