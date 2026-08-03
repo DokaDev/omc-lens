@@ -23,7 +23,7 @@ omc-lens is a visually enhanced statusline HUD for Claude Code, built on top of 
 - **Todo progress**: completed/total ratio with first in-progress item label (up to 30 characters)
 - **Vim mode indicator**: INSERT vs NORMAL with distinct colours
 - **Cache hit metrics**: per-request hit rate (`hr`), per-request efficiency (`ef`), and cumulative session hit rate (`cu`) with a 14-step colour gradient (cyan = high, red = low) and 3-tier per-turn delta colouring (noise / meaningful / large)
-- **Rate-limit gauges**: per-window usage bars with 14-step colour gradient
+- **Rate-limit gauges**: session (`5h`), weekly (`wk`), model-scoped weekly (`sn` / `op` / `fb`), and monthly (`mo`) windows, each with a 14-step colour gradient and time-to-reset. The model-scoped windows are read straight from the usage endpoint's `limits` array — Anthropic retired the legacy `seven_day_<model>` fields that OMC still reads, so these segments would otherwise stay blank. A window renders only when the account actually has that quota.
 - **Agent tree**: running sub-agents rendered as a box-drawing tree, up to four entries with overflow count
 - **Crash-safe**: any rendering error falls back to a dim one-line message; Claude Code is never interrupted
 - **Update notifications**: a `SessionStart` hook checks GitHub every 6 hours for new omc-lens and oh-my-claudecode releases. When an update is available it injects a parsable banner into Claude's session context and, **on macOS only**, also surfaces a native notification popup (consolidated into a single popup when both have updates). On other platforms the banner-only path is used.
@@ -91,7 +91,7 @@ To remove the plugin entirely:
 
 ## How It Works
 
-1. **Data collection** (`src/data/context.mjs`): `assembleContext()` reads the OMC state bridge (`src/data/omc-bridge.mjs`) to gather model info, token counts, cost, todos, agents, git status, rate-limit windows, and more.
+1. **Data collection** (`src/data/context.mjs`): `assembleContext()` reads the OMC state bridge (`src/lib/omc-bridge.mjs`) to gather model info, token counts, cost, todos, agents, git status, rate-limit windows, and more. Model-scoped weekly limits come from `src/data/usage-direct.mjs`, which queries `/api/oauth/usage` itself because OMC parses that response internally and never exposes its `limits` array. It reads OAuth credentials read-only (Keychain, then `~/.claude/.credentials.json`), never refreshes or writes them back, and caches machine-wide for 5 minutes so concurrent sessions do not multiply requests against an endpoint that rate-limits aggressively. Anything OMC does supply takes precedence, so a future OMC release that learns `limits[]` takes over on its own.
 2. **Rendering pipeline**:
    - `renderLine1(ctx)` — identity bar (model with version extraction, CWD, git, OMC version with update check, omc-lens update indicator)
    - `renderLine2(ctx)` — context gradient bar, token/cost/call counters, todos

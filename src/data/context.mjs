@@ -27,6 +27,7 @@ import {
 import { getGitBranch, getGitStatusCounts } from './git.mjs';
 import { calculateSessionCost, getModelTier } from './cost.mjs';
 import { checkOmcVersion, checkLensVersion } from './version-check.mjs';
+import { getScopedWeeklyLimits } from './usage-direct.mjs';
 import { readFileSync, writeFileSync, statSync, openSync, readSync, closeSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -409,11 +410,23 @@ export async function assembleContext(options = {}) {
       const usageResult = await getUsage();
       rateLimits = usageResult.rateLimits || null;
       rateLimitError = usageResult.error || undefined;
-      if (rateLimits) {
-        try { writeFileSync(_rlCachePath, JSON.stringify(rateLimits), 'utf8'); } catch {}
-      }
     } catch {
       rateLimitError = 'fetch_error';
+    }
+    // Model-scoped weekly windows (Fable/Sonnet/Opus). OMC still reads the
+    // legacy seven_day_<model> keys, which Anthropic now returns null for
+    // after moving those windows into the response's `limits` array, so it no
+    // longer produces these buckets. Fetch them separately and let anything
+    // OMC did produce win — an OMC release that learns `limits[]` then takes
+    // over silently, with no change needed here.
+    try {
+      const scoped = await getScopedWeeklyLimits();
+      if (scoped) rateLimits = { ...scoped, ...(rateLimits || {}) };
+    } catch {
+      // Scoped segments simply do not render.
+    }
+    if (rateLimits) {
+      try { writeFileSync(_rlCachePath, JSON.stringify(rateLimits), 'utf8'); } catch {}
     }
     // Fallback: read stale cache if fetch failed
     if (!rateLimits) {

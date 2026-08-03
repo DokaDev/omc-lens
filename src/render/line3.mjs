@@ -24,6 +24,24 @@ const RATE_COLORS = [
 ];
 
 /**
+ * Rate-limit windows, in display order.
+ *
+ * The model-scoped weekly rows (sn/op/fb) come from the usage response's
+ * `limits` array via data/usage-direct.mjs; the rest come from OMC. A window
+ * renders only when its percent field is present, so accounts without a given
+ * quota simply do not show that segment. `cycle` feeds formatResetIn's
+ * next-cycle rollover; a null resetsKey means the API sends no reset for it.
+ */
+const RATE_WINDOWS = [
+  { label: '5h', percentKey: 'fiveHourPercent', resetsKey: 'fiveHourResetsAt', cycle: '5h' },
+  { label: 'wk', percentKey: 'weeklyPercent', resetsKey: 'weeklyResetsAt', cycle: 'wk' },
+  { label: 'sn', percentKey: 'sonnetWeeklyPercent', resetsKey: 'sonnetWeeklyResetsAt', cycle: 'wk' },
+  { label: 'op', percentKey: 'opusWeeklyPercent', resetsKey: 'opusWeeklyResetsAt', cycle: 'wk' },
+  { label: 'fb', percentKey: 'fableWeeklyPercent', resetsKey: 'fableWeeklyResetsAt', cycle: 'wk' },
+  { label: 'mo', percentKey: 'monthlyPercent', resetsKey: null, cycle: 'mo' },
+];
+
+/**
  * Get 256-color code for rate limit usage percentage.
  * @param {number} u  Usage percentage 0-100
  * @returns {number}  256-color code
@@ -126,54 +144,16 @@ export function renderLine3(ctx) {
     const rateParts = [];
     let maxU = 0;
 
-    if (ctx.rateLimits.fiveHourPercent !== undefined) {
-      const u = ctx.rateLimits.fiveHourPercent;
+    for (const { label, percentKey, resetsKey, cycle } of RATE_WINDOWS) {
+      const u = ctx.rateLimits[percentKey];
+      if (u === undefined) continue;
       maxU = Math.max(maxU, u);
-      let s = `\x1b[97m5h ${fg256(rateColor(u), `${u}%`)}`;
-      if (ctx.rateLimits.fiveHourResetsAt) {
-        const resetIn = formatResetIn(ctx.rateLimits.fiveHourResetsAt, '5h');
+      let s = `\x1b[97m${label} ${fg256(rateColor(u), `${u}%`)}`;
+      if (resetsKey && ctx.rateLimits[resetsKey]) {
+        const resetIn = formatResetIn(ctx.rateLimits[resetsKey], cycle);
         if (resetIn) s += `\x1b[90m(${resetIn})\x1b[0m`;
       }
       rateParts.push(s);
-    }
-
-    if (ctx.rateLimits.weeklyPercent !== undefined) {
-      const u = ctx.rateLimits.weeklyPercent;
-      maxU = Math.max(maxU, u);
-      let s = `\x1b[97mwk ${fg256(rateColor(u), `${u}%`)}`;
-      if (ctx.rateLimits.weeklyResetsAt) {
-        const resetIn = formatResetIn(ctx.rateLimits.weeklyResetsAt, 'wk');
-        if (resetIn) s += `\x1b[90m(${resetIn})\x1b[0m`;
-      }
-      rateParts.push(s);
-    }
-
-    if (ctx.rateLimits.sonnetWeeklyPercent !== undefined) {
-      const u = ctx.rateLimits.sonnetWeeklyPercent;
-      maxU = Math.max(maxU, u);
-      let s = `\x1b[97msn ${fg256(rateColor(u), `${u}%`)}`;
-      if (ctx.rateLimits.sonnetWeeklyResetsAt) {
-        const resetIn = formatResetIn(ctx.rateLimits.sonnetWeeklyResetsAt, 'wk');
-        if (resetIn) s += `\x1b[90m(${resetIn})\x1b[0m`;
-      }
-      rateParts.push(s);
-    }
-
-    if (ctx.rateLimits.opusWeeklyPercent !== undefined) {
-      const u = ctx.rateLimits.opusWeeklyPercent;
-      maxU = Math.max(maxU, u);
-      let s = `\x1b[97mop ${fg256(rateColor(u), `${u}%`)}`;
-      if (ctx.rateLimits.opusWeeklyResetsAt) {
-        const resetIn = formatResetIn(ctx.rateLimits.opusWeeklyResetsAt, 'wk');
-        if (resetIn) s += `\x1b[90m(${resetIn})\x1b[0m`;
-      }
-      rateParts.push(s);
-    }
-
-    if (ctx.rateLimits.monthlyPercent !== undefined) {
-      const u = ctx.rateLimits.monthlyPercent;
-      maxU = Math.max(maxU, u);
-      rateParts.push(`\x1b[97mmo ${fg256(rateColor(u), `${u}%`)}`);
     }
 
     if (rateParts.length) {
