@@ -28,9 +28,13 @@ import { getGitBranch, getGitStatusCounts } from './git.mjs';
 import { calculateSessionCost, getModelTier } from './cost.mjs';
 import { checkOmcVersion, checkLensVersion } from './version-check.mjs';
 import { getScopedWeeklyLimits } from './usage-direct.mjs';
-import { readFileSync, writeFileSync, statSync, openSync, readSync, closeSync, existsSync } from 'node:fs';
+import {
+  readFileSync, writeFileSync, statSync, openSync, readSync, closeSync,
+  existsSync, renameSync, unlinkSync,
+} from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { createHash } from 'node:crypto';
 
 // ---------------------------------------------------------------------------
 // Cache snapshot reader (reads Stop-hook snapshot for per-turn deltas)
@@ -59,39 +63,155 @@ function readCacheSnapshot(sessionId) {
 }
 
 // ---------------------------------------------------------------------------
-// TaskCreate/TaskUpdate parser (fallback when OMC TodoWrite is empty)
+// Cumulative cache accounting (incremental transcript scan)
 // ---------------------------------------------------------------------------
-const MAX_TASK_TAIL = 512 * 1024;
 
 /**
- * Parse cumulative cache tokens from transcript JSONL.
- * Sums cache_read_input_tokens and cache_creation_input_tokens across all
- * assistant messages to compute a session-wide cumulative hit rate.
+ * Path of the running-totals record for one transcript.
+ *
+ * A fresh process runs on every statusline repaint, so this state has to live
+ * on disk to be worth anything — an in-process cache would never be read.
+ *
+ * @param {string} transcriptPath
+ * @returns {string}
+ */
+function cumulativeCachePath(transcriptPath) {
+  const key = createHash('sha256').update(transcriptPath).digest('hex').slice(0, 16);
+  return join(tmpdir(), `omc-lens-cumcache-${key}.json`);
+}
+
+/**
+ * @param {string} cachePath
+ * @param {number} ino  Current inode of the transcript
+ * @returns {{ino: number, offset: number, cuRead: number, cuCreated: number, cuFresh: number}|null}
+ */
+function readCumulativeState(cachePath, ino) {
+  try {
+    if (!existsSync(cachePath)) return null;
+    const s = JSON.parse(readFileSync(cachePath, 'utf8'));
+    if (!Number.isInteger(s?.offset) || s.offset < 0) return null;
+    // A different inode behind the same path means the transcript was replaced
+    // rather than appended to, so the totals describe a file that is no longer
+    // there and cannot be carried forward.
+    if (s.ino !== ino) return null;
+    for (const k of ['cuRead', 'cuCreated', 'cuFresh']) {
+      if (!Number.isFinite(s[k]) || s[k] < 0) return null;
+    }
+    return s;
+  } catch {
+    return null;
+  }
+}
+
+/** Write via temp file + rename so a concurrent render never reads a torn record. */
+function writeCumulativeState(cachePath, state) {
+  const tmpPath = `${cachePath}.${process.pid}.tmp`;
+  try {
+    writeFileSync(tmpPath, JSON.stringify(state), 'utf8');
+    renameSync(tmpPath, cachePath);
+  } catch {
+    try {
+      unlinkSync(tmpPath);
+    } catch {
+      // Nothing left to clean up.
+    }
+  }
+}
+
+/**
+ * Cumulative cache tokens for the session, summed over every assistant message
+ * in the transcript.
+ *
+ * The total is genuinely session-wide, so unlike parseTasksFromTranscript —
+ * which only needs the latest task state and can therefore read a tail slice —
+ * it cannot be capped without undercounting. Instead the running totals are
+ * stored alongside the byte offset they were computed through, and each render
+ * folds in only the newly appended bytes. A multi-tens-of-MB transcript costs
+ * one full pass on a session's first render and a few KB on every render after.
+ *
  * @param {string|null} transcriptPath
  * @returns {{ cuRead: number, cuCreated: number, cuFresh: number, cuHitRate: number }}
  */
 function parseCumulativeCacheFromTranscript(transcriptPath) {
   const result = { cuRead: 0, cuCreated: 0, cuFresh: 0, cuHitRate: 0 };
   if (!transcriptPath) return result;
+
+  let fd = null;
   try {
-    const lines = readFileSync(transcriptPath, 'utf8').split('\n');
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      try {
-        const entry = JSON.parse(line);
-        if (entry.type !== 'assistant') continue;
-        const u = entry.message?.usage;
-        if (!u) continue;
-        result.cuRead += u.cache_read_input_tokens || 0;
-        result.cuCreated += u.cache_creation_input_tokens || 0;
-        result.cuFresh += u.input_tokens || 0;
-      } catch { /* skip malformed line */ }
+    const stat = statSync(transcriptPath);
+    const cachePath = cumulativeCachePath(transcriptPath);
+
+    let state = readCumulativeState(cachePath, stat.ino);
+    // A file shorter than where the last pass stopped was truncated or rewritten
+    // in place, so the stored offset no longer points where it claims to.
+    if (state && state.offset > stat.size) state = null;
+
+    let offset = state ? state.offset : 0;
+    let cuRead = state ? state.cuRead : 0;
+    let cuCreated = state ? state.cuCreated : 0;
+    let cuFresh = state ? state.cuFresh : 0;
+
+    if (stat.size > offset) {
+      fd = openSync(transcriptPath, 'r');
+      const buf = Buffer.alloc(stat.size - offset);
+      const bytesRead = readSync(fd, buf, 0, buf.length, offset);
+      closeSync(fd);
+      fd = null;
+
+      // Stop at the final newline. The transcript is appended to while we read
+      // it, so the tail is routinely a half-written line; consuming it would
+      // both mis-parse and advance the offset past an entry that would then
+      // never be counted. A newline byte never appears inside a multi-byte
+      // UTF-8 sequence either, so cutting there always leaves a decodable
+      // slice — and the offset consequently always sits at a line boundary.
+      const chunk = buf.subarray(0, bytesRead);
+      const lastNewline = chunk.lastIndexOf(0x0a);
+
+      if (lastNewline >= 0) {
+        const text = chunk.subarray(0, lastNewline + 1).toString('utf8');
+        for (const line of text.split('\n')) {
+          if (!line.trim()) continue;
+          try {
+            const entry = JSON.parse(line);
+            if (entry.type !== 'assistant') continue;
+            const u = entry.message?.usage;
+            if (!u) continue;
+            cuRead += u.cache_read_input_tokens || 0;
+            cuCreated += u.cache_creation_input_tokens || 0;
+            cuFresh += u.input_tokens || 0;
+          } catch { /* skip malformed line */ }
+        }
+        offset += lastNewline + 1;
+        // Offset and totals are written as a single record, so whichever of two
+        // concurrent renders writes last, the pair stays internally consistent
+        // and the next render resumes from a matching offset.
+        writeCumulativeState(cachePath, { ino: stat.ino, offset, cuRead, cuCreated, cuFresh });
+      }
     }
-    const denom = result.cuRead + result.cuCreated + result.cuFresh;
-    result.cuHitRate = denom > 0 ? result.cuRead / denom : 0;
-  } catch { /* file read error — return zeros */ }
+
+    result.cuRead = cuRead;
+    result.cuCreated = cuCreated;
+    result.cuFresh = cuFresh;
+    const denom = cuRead + cuCreated + cuFresh;
+    result.cuHitRate = denom > 0 ? cuRead / denom : 0;
+  } catch {
+    /* file read error — return zeros */
+  } finally {
+    if (fd !== null) {
+      try {
+        closeSync(fd);
+      } catch {
+        // Already closed.
+      }
+    }
+  }
   return result;
 }
+
+// ---------------------------------------------------------------------------
+// TaskCreate/TaskUpdate parser (fallback when OMC TodoWrite is empty)
+// ---------------------------------------------------------------------------
+const MAX_TASK_TAIL = 512 * 1024;
 
 /**
  * Parse TaskCreate/TaskUpdate from transcript JSONL to build a task list.
