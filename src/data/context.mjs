@@ -63,52 +63,51 @@ function readCacheSnapshot(sessionId) {
 }
 
 // ---------------------------------------------------------------------------
-// Cumulative cache accounting (incremental transcript scan)
+// Incremental transcript scan
 // ---------------------------------------------------------------------------
 
 /**
- * Path of the running-totals record for one transcript.
+ * Path of the resume record for one transcript under one kind of scan.
  *
  * A fresh process runs on every statusline repaint, so this state has to live
  * on disk to be worth anything — an in-process cache would never be read.
  *
+ * @param {string} kind            Namespace, so two scans never share a record
  * @param {string} transcriptPath
  * @returns {string}
  */
-function cumulativeCachePath(transcriptPath) {
+function scanRecordPath(kind, transcriptPath) {
   const key = createHash('sha256').update(transcriptPath).digest('hex').slice(0, 16);
-  return join(tmpdir(), `omc-lens-cumcache-${key}.json`);
+  return join(tmpdir(), `omc-lens-scan-${kind}-${key}.json`);
 }
 
 /**
- * @param {string} cachePath
+ * @param {string} recordPath
  * @param {number} ino  Current inode of the transcript
- * @returns {{ino: number, offset: number, cuRead: number, cuCreated: number, cuFresh: number}|null}
+ * @returns {{ino: number, offset: number, data: object}|null}
  */
-function readCumulativeState(cachePath, ino) {
+function readScanRecord(recordPath, ino) {
   try {
-    if (!existsSync(cachePath)) return null;
-    const s = JSON.parse(readFileSync(cachePath, 'utf8'));
-    if (!Number.isInteger(s?.offset) || s.offset < 0) return null;
+    if (!existsSync(recordPath)) return null;
+    const r = JSON.parse(readFileSync(recordPath, 'utf8'));
+    if (!Number.isInteger(r?.offset) || r.offset < 0) return null;
+    if (typeof r.data !== 'object' || r.data === null) return null;
     // A different inode behind the same path means the transcript was replaced
-    // rather than appended to, so the totals describe a file that is no longer
+    // rather than appended to, so the state describes a file that is no longer
     // there and cannot be carried forward.
-    if (s.ino !== ino) return null;
-    for (const k of ['cuRead', 'cuCreated', 'cuFresh']) {
-      if (!Number.isFinite(s[k]) || s[k] < 0) return null;
-    }
-    return s;
+    if (r.ino !== ino) return null;
+    return r;
   } catch {
     return null;
   }
 }
 
 /** Write via temp file + rename so a concurrent render never reads a torn record. */
-function writeCumulativeState(cachePath, state) {
-  const tmpPath = `${cachePath}.${process.pid}.tmp`;
+function writeScanRecord(recordPath, record) {
+  const tmpPath = `${recordPath}.${process.pid}.tmp`;
   try {
-    writeFileSync(tmpPath, JSON.stringify(state), 'utf8');
-    renameSync(tmpPath, cachePath);
+    writeFileSync(tmpPath, JSON.stringify(record), 'utf8');
+    renameSync(tmpPath, recordPath);
   } catch {
     try {
       unlinkSync(tmpPath);
@@ -119,37 +118,37 @@ function writeCumulativeState(cachePath, state) {
 }
 
 /**
- * Cumulative cache tokens for the session, summed over every assistant message
- * in the transcript.
+ * Fold over a transcript's entries, resuming where the previous render stopped.
  *
- * The total is genuinely session-wide, so unlike parseTasksFromTranscript —
- * which only needs the latest task state and can therefore read a tail slice —
- * it cannot be capped without undercounting. Instead the running totals are
- * stored alongside the byte offset they were computed through, and each render
- * folds in only the newly appended bytes. A multi-tens-of-MB transcript costs
- * one full pass on a session's first render and a few KB on every render after.
+ * Both things this file needs from a transcript — cumulative cache tokens and
+ * the task list — are left folds over the entries in order, so neither can be
+ * taken from a tail slice: the token totals would undercount, and the task list
+ * would miss its TaskCreate entries entirely, since tasks are created at the
+ * start of a work block and updated throughout it. Instead the fold state is
+ * stored with the byte offset it was computed through, and each render folds in
+ * only the newly appended bytes. A multi-tens-of-MB transcript costs one full
+ * pass on a session's first render and a few KB on every render after.
  *
- * @param {string|null} transcriptPath
- * @returns {{ cuRead: number, cuCreated: number, cuFresh: number, cuHitRate: number }}
+ * @template T
+ * @param {string} transcriptPath
+ * @param {string} kind                              Record namespace
+ * @param {() => T} seed                             Fresh state when starting over
+ * @param {(state: T, entry: object) => void} apply  Called per entry, in order
+ * @returns {T|null} the fold state, or null when the transcript is unreadable
  */
-function parseCumulativeCacheFromTranscript(transcriptPath) {
-  const result = { cuRead: 0, cuCreated: 0, cuFresh: 0, cuHitRate: 0 };
-  if (!transcriptPath) return result;
-
+function scanTranscript(transcriptPath, kind, seed, apply) {
   let fd = null;
   try {
     const stat = statSync(transcriptPath);
-    const cachePath = cumulativeCachePath(transcriptPath);
+    const recordPath = scanRecordPath(kind, transcriptPath);
 
-    let state = readCumulativeState(cachePath, stat.ino);
+    let record = readScanRecord(recordPath, stat.ino);
     // A file shorter than where the last pass stopped was truncated or rewritten
     // in place, so the stored offset no longer points where it claims to.
-    if (state && state.offset > stat.size) state = null;
+    if (record && record.offset > stat.size) record = null;
 
-    let offset = state ? state.offset : 0;
-    let cuRead = state ? state.cuRead : 0;
-    let cuCreated = state ? state.cuCreated : 0;
-    let cuFresh = state ? state.cuFresh : 0;
+    let offset = record ? record.offset : 0;
+    const data = record ? record.data : seed();
 
     if (stat.size > offset) {
       fd = openSync(transcriptPath, 'r');
@@ -161,7 +160,7 @@ function parseCumulativeCacheFromTranscript(transcriptPath) {
       // Stop at the final newline. The transcript is appended to while we read
       // it, so the tail is routinely a half-written line; consuming it would
       // both mis-parse and advance the offset past an entry that would then
-      // never be counted. A newline byte never appears inside a multi-byte
+      // never be seen again. A newline byte never appears inside a multi-byte
       // UTF-8 sequence either, so cutting there always leaves a decodable
       // slice — and the offset consequently always sits at a line boundary.
       const chunk = buf.subarray(0, bytesRead);
@@ -172,30 +171,19 @@ function parseCumulativeCacheFromTranscript(transcriptPath) {
         for (const line of text.split('\n')) {
           if (!line.trim()) continue;
           try {
-            const entry = JSON.parse(line);
-            if (entry.type !== 'assistant') continue;
-            const u = entry.message?.usage;
-            if (!u) continue;
-            cuRead += u.cache_read_input_tokens || 0;
-            cuCreated += u.cache_creation_input_tokens || 0;
-            cuFresh += u.input_tokens || 0;
+            apply(data, JSON.parse(line));
           } catch { /* skip malformed line */ }
         }
         offset += lastNewline + 1;
-        // Offset and totals are written as a single record, so whichever of two
+        // Offset and state are written as a single record, so whichever of two
         // concurrent renders writes last, the pair stays internally consistent
         // and the next render resumes from a matching offset.
-        writeCumulativeState(cachePath, { ino: stat.ino, offset, cuRead, cuCreated, cuFresh });
+        writeScanRecord(recordPath, { ino: stat.ino, offset, data });
       }
     }
-
-    result.cuRead = cuRead;
-    result.cuCreated = cuCreated;
-    result.cuFresh = cuFresh;
-    const denom = cuRead + cuCreated + cuFresh;
-    result.cuHitRate = denom > 0 ? cuRead / denom : 0;
+    return data;
   } catch {
-    /* file read error — return zeros */
+    return null;
   } finally {
     if (fd !== null) {
       try {
@@ -205,119 +193,176 @@ function parseCumulativeCacheFromTranscript(transcriptPath) {
       }
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Cumulative cache accounting
+// ---------------------------------------------------------------------------
+
+/**
+ * Cumulative cache tokens for the session, summed over every assistant message
+ * in the transcript.
+ *
+ * @param {string|null} transcriptPath
+ * @returns {{ cuRead: number, cuCreated: number, cuFresh: number, cuHitRate: number }}
+ */
+function parseCumulativeCacheFromTranscript(transcriptPath) {
+  const result = { cuRead: 0, cuCreated: 0, cuFresh: 0, cuHitRate: 0 };
+  if (!transcriptPath) return result;
+
+  const data = scanTranscript(
+    transcriptPath,
+    'cumcache',
+    () => ({ cuRead: 0, cuCreated: 0, cuFresh: 0 }),
+    (acc, entry) => {
+      if (entry.type !== 'assistant') return;
+      const u = entry.message?.usage;
+      if (!u) return;
+      acc.cuRead += u.cache_read_input_tokens || 0;
+      acc.cuCreated += u.cache_creation_input_tokens || 0;
+      acc.cuFresh += u.input_tokens || 0;
+    },
+  );
+  if (!data) return result;
+
+  result.cuRead = data.cuRead;
+  result.cuCreated = data.cuCreated;
+  result.cuFresh = data.cuFresh;
+  const denom = data.cuRead + data.cuCreated + data.cuFresh;
+  result.cuHitRate = denom > 0 ? data.cuRead / denom : 0;
   return result;
 }
 
 // ---------------------------------------------------------------------------
-// TaskCreate/TaskUpdate parser (fallback when OMC TodoWrite is empty)
+// Task list (TaskCreate / TaskUpdate)
 // ---------------------------------------------------------------------------
-const MAX_TASK_TAIL = 512 * 1024;
+
+const TASK_CREATE_TOOLS = new Set(['TaskCreate', 'proxy_TaskCreate']);
+const TASK_UPDATE_TOOLS = new Set(['TaskUpdate', 'proxy_TaskUpdate']);
+/** A TaskCreate's result announces the number the task was actually given. */
+const TASK_NUMBER_RE = /Task #(\d+) created/;
+/** Cap on creates still awaiting a result, so the record cannot grow unbounded. */
+const MAX_PENDING_CREATES = 100;
 
 /**
- * Parse TaskCreate/TaskUpdate from transcript JSONL to build a task list.
- * Only used as fallback when OMC's TodoWrite-based todos are empty.
+ * Flatten a tool_result's content, which is either a plain string or blocks.
+ * @param {unknown} content
+ * @returns {string}
+ */
+function toolResultText(content) {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content.map((b) => (typeof b === 'string' ? b : b?.text || '')).join(' ');
+  }
+  return '';
+}
+
+/**
+ * Apply one TaskUpdate to the task map.
+ *
+ * @param {{tasks: object}} state
+ * @param {object} input  The tool_use input
+ */
+function applyTaskUpdate(state, input) {
+  // The wire field is `taskId`. `id` is accepted only so that a renamed or
+  // older shape degrades instead of silently updating nothing — which is
+  // exactly how this parser used to fail: it read `id`, the field never
+  // existed, and every task stayed pending for the life of the session.
+  const num = input?.taskId ?? input?.id;
+  // Not every TaskUpdate carries a status: `{taskId, metadata}` and
+  // `{taskId, addBlockedBy}` are both real shapes and must leave status alone.
+  if (num == null || !input?.status) return;
+
+  const key = String(Number(num));
+  if (!Object.prototype.hasOwnProperty.call(state.tasks, key)) return;
+
+  if (input.status === 'deleted') {
+    delete state.tasks[key];
+    return;
+  }
+  state.tasks[key].status =
+    input.status === 'completed' ? 'completed'
+      : input.status === 'in_progress' ? 'in_progress'
+        : 'pending';
+}
+
+/**
+ * Fold one transcript entry into the task state.
+ *
+ * A TaskCreate call does not carry the task's number — it comes back in the
+ * result a couple of lines later ("Task #3 created successfully: …"), keyed by
+ * tool_use_id. A create is therefore staged by its tool_use_id and becomes a
+ * task only once its result names the number. That number is authoritative;
+ * inferring it from creation order breaks the moment any create is missed.
+ *
+ * @param {{maxNum: number, tasks: object, pending: object}} state
+ * @param {object} entry
+ */
+function applyTaskEntry(state, entry) {
+  const content = entry.message?.content;
+  if (!Array.isArray(content)) return;
+
+  for (const block of content) {
+    if (block?.type === 'tool_use') {
+      if (TASK_CREATE_TOOLS.has(block.name)) {
+        if (block.id && block.input?.subject) {
+          const staged = Object.keys(state.pending);
+          if (staged.length >= MAX_PENDING_CREATES) delete state.pending[staged[0]];
+          state.pending[block.id] = block.input.subject;
+        }
+      } else if (TASK_UPDATE_TOOLS.has(block.name)) {
+        applyTaskUpdate(state, block.input);
+      }
+      continue;
+    }
+
+    if (block?.type !== 'tool_result') continue;
+    const subject = state.pending[block.tool_use_id];
+    if (subject === undefined) continue;
+    delete state.pending[block.tool_use_id];
+
+    const matched = TASK_NUMBER_RE.exec(toolResultText(block.content));
+    if (!matched) continue;
+    const num = Number(matched[1]);
+
+    // Numbering restarts when the task list is reset mid-session (one observed
+    // transcript runs 1..28 and then starts over at 1). A number at or below
+    // the running high-water mark means a new generation, so the old list is
+    // gone rather than something to merge into.
+    if (num <= state.maxNum) {
+      state.tasks = {};
+      state.maxNum = 0;
+    }
+    state.maxNum = Math.max(state.maxNum, num);
+    state.tasks[String(num)] = { content: subject, status: 'pending' };
+  }
+}
+
+/**
+ * Build the task list from a transcript's TaskCreate/TaskUpdate calls.
+ *
+ * Despite how it is wired up, this is not a fallback: OMC's parseTranscript
+ * populates todos only from TodoWrite, which nothing calls in practice, so this
+ * is the sole source for the Line 2 counter.
  *
  * @param {string|null} transcriptPath
  * @returns {Array<{content: string, status: string}>}
  */
 function parseTasksFromTranscript(transcriptPath) {
   if (!transcriptPath) return [];
-  try {
-    const stat = statSync(transcriptPath);
-    let lines;
-    if (stat.size > MAX_TASK_TAIL) {
-      const startOffset = Math.max(0, stat.size - MAX_TASK_TAIL);
-      const fd = openSync(transcriptPath, 'r');
-      const buf = Buffer.alloc(stat.size - startOffset);
-      readSync(fd, buf, 0, buf.length, startOffset);
-      closeSync(fd);
-      lines = buf.toString('utf8').split('\n');
-      if (startOffset > 0) lines.shift();
-    } else {
-      lines = readFileSync(transcriptPath, 'utf8').split('\n');
-    }
 
-    const taskMap = new Map(); // id -> {content, status}
+  const data = scanTranscript(
+    transcriptPath,
+    'tasks',
+    () => ({ maxNum: 0, tasks: {}, pending: {} }),
+    applyTaskEntry,
+  );
+  if (!data) return [];
 
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      try {
-        const entry = JSON.parse(line);
-        const content = entry.message?.content;
-        if (!Array.isArray(content)) continue;
-
-        for (const block of content) {
-          if (block.type !== 'tool_use') continue;
-
-          if (block.name === 'TaskCreate' || block.name === 'proxy_TaskCreate') {
-            const input = block.input;
-            if (input?.subject) {
-              taskMap.set(block.id, {
-                content: input.subject,
-                status: 'pending',
-              });
-            }
-          }
-
-          if (block.name === 'TaskUpdate' || block.name === 'proxy_TaskUpdate') {
-            const input = block.input;
-            if (input?.id && input?.status) {
-              // Find existing task by matching — TaskUpdate uses numeric IDs
-              // but TaskCreate block.id is different. Match via iteration.
-              for (const [key, task] of taskMap) {
-                // TaskUpdate input.id is a number like "1", "2"
-                // We track creation order implicitly
-                if (task._taskNum === String(input.id)) {
-                  task.status = input.status === 'completed' ? 'completed'
-                    : input.status === 'in_progress' ? 'in_progress'
-                    : 'pending';
-                }
-              }
-            }
-          }
-        }
-      } catch {
-        // skip malformed lines
-      }
-    }
-
-    // Assign task numbers by creation order
-    let num = 1;
-    for (const task of taskMap.values()) {
-      task._taskNum = String(num++);
-    }
-
-    // Re-parse for TaskUpdate now that we have task numbers
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      try {
-        const entry = JSON.parse(line);
-        const content = entry.message?.content;
-        if (!Array.isArray(content)) continue;
-        for (const block of content) {
-          if (block.type === 'tool_use' && (block.name === 'TaskUpdate' || block.name === 'proxy_TaskUpdate')) {
-            const input = block.input;
-            if (input?.id && input?.status) {
-              for (const task of taskMap.values()) {
-                if (task._taskNum === String(input.id)) {
-                  task.status = input.status === 'completed' ? 'completed'
-                    : input.status === 'in_progress' ? 'in_progress'
-                    : 'pending';
-                }
-              }
-            }
-          }
-        }
-      } catch { /* skip */ }
-    }
-
-    return Array.from(taskMap.values()).map(t => ({
-      content: t.content,
-      status: t.status,
-    }));
-  } catch {
-    return [];
-  }
+  return Object.keys(data.tasks)
+    .map(Number)
+    .sort((a, b) => a - b)
+    .map((n) => ({ content: data.tasks[n].content, status: data.tasks[n].status }));
 }
 
 // ---------------------------------------------------------------------------
