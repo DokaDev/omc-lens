@@ -77,17 +77,20 @@ function buildBar(pct) {
 function renderTodos(todos) {
   const icon = getIcon('todo');
 
-  if (!todos || !todos.length) {
-    return `${fg256(81, icon)} ${fg256(81, '0/0')}`;
-  }
+  // "0/0" is an affirmative claim, and it was previously what a session with no
+  // tasks, a null transcript path, and a parse that failed and returned []
+  // all rendered — in the same cyan used to signal an active list, so a broken
+  // counter was indistinguishable from a working one. Show a neutral dim
+  // placeholder instead, and keep the colours for lists that actually exist.
+  const noTasks = `${fg256(245, icon)} ${fg256(245, '—')}`;
+
+  if (!Array.isArray(todos) || todos.length === 0) return noTasks;
 
   // [omc-lens #2 sync] Filter null and non-object entries before reading
   // status so malformed transcript tails cannot throw here.
-  const safe = (todos ?? []).filter(t => t && typeof t === 'object');
+  const safe = todos.filter(t => t && typeof t === 'object');
 
-  if (!safe.length) {
-    return `${fg256(81, icon)} ${fg256(81, '0/0')}`;
-  }
+  if (!safe.length) return noTasks;
 
   const done = safe.filter(t => t.status === 'completed').length;
   const inProgress = safe.filter(t => t.status === 'in_progress').length;
