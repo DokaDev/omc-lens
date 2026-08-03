@@ -53,6 +53,12 @@ const TIER_COLORS = {
  * e.g. 'claude-opus-4-6' -> 'Opus 4.6', 'claude-sonnet-4-5' -> 'Sonnet 4.5'
  */
 function formatModelDisplay(raw) {
+  // OMC's getModelName returns null by contract (display_name -> model id ->
+  // null), and context.mjs wraps it in safeCall, which only substitutes on a
+  // throw — not on a null return. Without this guard the .match() below throws
+  // past renderLine1 to hud.mjs's catch-all, collapsing all three lines into a
+  // single "HUD error" message for as long as model metadata is missing.
+  if (typeof raw !== 'string' || raw.trim() === '') return 'Unknown';
   const m = raw.match(/(opus|sonnet|haiku)[- ]?(\d+)[.-](\d+)/i);
   if (m) {
     const name = m[1].charAt(0).toUpperCase() + m[1].slice(1).toLowerCase();
