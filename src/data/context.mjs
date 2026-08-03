@@ -213,7 +213,7 @@ let _previousStdin = null;
 /**
  * @typedef {Object} RenderContext
  * @property {string} model                     Model display name
- * @property {string} modelTier                  'opus'|'sonnet'|'haiku'
+ * @property {string} modelTier                  'fable'|'opus'|'sonnet'|'haiku'
  * @property {number} contextPercent             Context window usage 0-100
  * @property {number|null} contextWindowSize     Context window size in tokens
  * @property {string|null} cwd                   Current working directory

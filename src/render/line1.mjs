@@ -39,6 +39,7 @@ const SEP = dim('|');
 
 /** Model tier -> 256-color code */
 const TIER_COLORS = {
+  fable: 220,   // gold
   opus: 171,    // magenta
   sonnet: 81,   // cyan
   haiku: 114,   // green
