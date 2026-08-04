@@ -171,9 +171,14 @@ export function renderLine2(ctx) {
     let s = `${fg256(208, getIcon('wrench'))} ${fg256(255, String(ctx.toolCallCount || 0))}`;
     s += ` ${fg256(81, getIcon('robot'))} ${fg256(255, String(ctx.agentCallCount || 0))}`;
     s += ` ${fg256(171, getIcon('flash'))} ${fg256(255, String(ctx.skillCallCount || 0))}`;
-    if (ctx.lastActivatedSkill) {
-      s += ` ${fg256(171, ctx.lastActivatedSkill.name)}`;
-    }
+    // The last skill's name is deliberately not shown. It comes from OMC's
+    // 4MB-tail transcript read, so it vanishes once that call scrolls out of
+    // the window — the name would appear and then disappear mid-session while
+    // the count beside it stayed put. ctx.lastActivatedSkill is still
+    // assembled; re-enable this once the name has a whole-transcript source.
+    // if (ctx.lastActivatedSkill) {
+    //   s += ` ${fg256(171, ctx.lastActivatedSkill.name)}`;
+    // }
     return s;
   });
 
