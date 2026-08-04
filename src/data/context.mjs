@@ -196,24 +196,35 @@ function scanTranscript(transcriptPath, kind, seed, apply) {
 }
 
 // ---------------------------------------------------------------------------
-// Cumulative cache accounting
+// Cumulative usage accounting
 // ---------------------------------------------------------------------------
 
 /**
- * Cumulative cache tokens for the session, summed over every assistant message
- * in the transcript.
+ * Session-cumulative token usage, summed over every assistant message in the
+ * transcript.
+ *
+ * This is the only source of genuinely cumulative numbers. The stdin
+ * `context_window` fields are NOT cumulative despite their names:
+ * `total_input_tokens` is the size of the current prompt (it tracks the CTX
+ * gauge exactly — 810.7k against a 1M window reads 81%), and
+ * `total_output_tokens` is the last response alone. Feeding either into a
+ * per-session total or a cost formula counts the wrong thing, so both the
+ * token readout and the cost are computed from here instead.
  *
  * @param {string|null} transcriptPath
- * @returns {{ cuRead: number, cuCreated: number, cuFresh: number, cuHitRate: number }}
+ * @returns {{ cuRead: number, cuCreated: number, cuFresh: number, cuOutput: number, cuHitRate: number }}
  */
-function parseCumulativeCacheFromTranscript(transcriptPath) {
-  const result = { cuRead: 0, cuCreated: 0, cuFresh: 0, cuHitRate: 0 };
+function parseCumulativeUsageFromTranscript(transcriptPath) {
+  const result = { cuRead: 0, cuCreated: 0, cuFresh: 0, cuOutput: 0, cuHitRate: 0 };
   if (!transcriptPath) return result;
 
+  // The record namespace is versioned: an older record predates cuOutput, and
+  // resuming from it would leave the output total permanently short by
+  // everything that came before this release.
   const data = scanTranscript(
     transcriptPath,
-    'cumcache',
-    () => ({ cuRead: 0, cuCreated: 0, cuFresh: 0 }),
+    'usage2',
+    () => ({ cuRead: 0, cuCreated: 0, cuFresh: 0, cuOutput: 0 }),
     (acc, entry) => {
       if (entry.type !== 'assistant') return;
       const u = entry.message?.usage;
@@ -221,6 +232,7 @@ function parseCumulativeCacheFromTranscript(transcriptPath) {
       acc.cuRead += u.cache_read_input_tokens || 0;
       acc.cuCreated += u.cache_creation_input_tokens || 0;
       acc.cuFresh += u.input_tokens || 0;
+      acc.cuOutput += u.output_tokens || 0;
     },
   );
   if (!data) return result;
@@ -228,6 +240,7 @@ function parseCumulativeCacheFromTranscript(transcriptPath) {
   result.cuRead = data.cuRead;
   result.cuCreated = data.cuCreated;
   result.cuFresh = data.cuFresh;
+  result.cuOutput = data.cuOutput;
   const denom = data.cuRead + data.cuCreated + data.cuFresh;
   result.cuHitRate = denom > 0 ? data.cuRead / denom : 0;
   return result;
@@ -384,8 +397,8 @@ let _previousStdin = null;
  * @property {string|null} cwd                   Current working directory
  * @property {string|null} transcriptPath        Path to transcript JSONL
  * @property {Object} tokens                     Token breakdown
- * @property {number} tokens.inputTokens         Current request input tokens
- * @property {number} tokens.outputTokens        Current request output tokens
+ * @property {number} tokens.inputTokens         Session-cumulative fresh (uncached) input tokens
+ * @property {number} tokens.outputTokens        Session-cumulative output tokens
  * @property {number|null} tokens.reasoningTokens  Reasoning tokens (if any)
  * @property {number|null} tokens.sessionTotal   Session total tokens (if available)
  * @property {number} cost                       Session cost in USD
@@ -485,46 +498,53 @@ export async function assembleContext(options = {}) {
   const sessionTotalTokens = txData?.sessionTotalTokens || null;
 
   // ── Token Breakdown ────────────────────────────────────────────────────
-  // stdin context_window.total_input_tokens / total_output_tokens = session cumulative
-  // stdin context_window.current_usage = per-request snapshot (cache breakdown)
-  // sessionTotalTokens = cumulative from OMC parseTranscript (fallback)
+  // Despite their names, neither stdin field is session-cumulative:
+  //   context_window.total_input_tokens  = size of the CURRENT prompt. It
+  //     tracks the CTX gauge exactly — 810.7k against a 1M window reads 81%.
+  //   context_window.total_output_tokens = the LAST response alone.
+  //   context_window.current_usage       = per-request cache breakdown.
+  // Only the transcript scan yields real per-session totals, so the ↓/↑/Σ
+  // readout and the cost both come from there.
   const ctxWindow = stdin?.context_window;
   const currentUsage = ctxWindow?.current_usage;
-  const totalInput = ctxWindow?.total_input_tokens || 0;
-  const totalOutput = ctxWindow?.total_output_tokens || 0;
+  const promptTokens = ctxWindow?.total_input_tokens || 0;
   const cacheCreate = currentUsage?.cache_creation_input_tokens || 0;
   const cacheRead = currentUsage?.cache_read_input_tokens || 0;
-  const cacheDenom = cacheRead + cacheCreate + totalInput;
+  // The prompt total already contains the cache reads and writes, so it is the
+  // hit-rate denominator on its own. Adding the cache terms to it counted them
+  // a second time and pinned the rate at roughly half its true value — a 100%
+  // cached request reported 50%. Fall back to the cache terms alone when the
+  // field is missing, which degrades the rate to the efficiency figure rather
+  // than to zero.
+  const cacheDenom = promptTokens || (cacheRead + cacheCreate);
   const cacheWriteReadSum = cacheRead + cacheCreate;
-  // Cumulative cache totals across the full transcript — required so that
-  // cost and sessionTotal align in units with totalInput/totalOutput
-  // (which are already session-cumulative). current_usage is a per-request
-  // snapshot and must not be fed into a cumulative cost formula.
-  const cumulativeCache = parseCumulativeCacheFromTranscript(transcriptPath);
+  const cumulative = parseCumulativeUsageFromTranscript(transcriptPath);
   const tokens = {
-    inputTokens: totalInput,
-    outputTokens: totalOutput,
+    inputTokens: cumulative.cuFresh,
+    outputTokens: cumulative.cuOutput,
     reasoningTokens: lastRequestTokenUsage?.reasoningTokens || null,
-    cacheCreateTokens: cacheCreate,
-    cacheReadTokens: cacheRead,
-    cacheHitRate: cacheDenom > 0 ? cacheRead / cacheDenom : 0,
+    // Clamped: a prompt total that lags the current_usage snapshot by a
+    // request would otherwise read above 100%.
+    cacheHitRate: cacheDenom > 0 ? Math.min(1, cacheRead / cacheDenom) : 0,
     cacheEfficiency: cacheWriteReadSum > 0 ? cacheRead / cacheWriteReadSum : 0,
-    cacheCumulativeHitRate: cumulativeCache.cuHitRate,
+    cacheCumulativeHitRate: cumulative.cuHitRate,
     ...readCacheSnapshot(stdin?.session_id),
     sessionTotal:
-      (totalInput + totalOutput + cumulativeCache.cuRead + cumulativeCache.cuCreated)
+      (cumulative.cuFresh + cumulative.cuOutput + cumulative.cuRead + cumulative.cuCreated)
       || sessionTotalTokens
       || 0,
   };
 
   // ── Cost ───────────────────────────────────────────────────────────────
-  // Use cumulative cache totals so every term in the cost formula is in the
-  // same "session cumulative" unit as inputTokens/outputTokens.
+  // Every term is a session total from the transcript. Passing the stdin
+  // fields here billed the current prompt as if it were fresh input — the
+  // same tokens the cache-read term already covers, at ten times the rate —
+  // while billing only the last response's output.
   const cost = calculateSessionCost(model, {
-    inputTokens: totalInput,
-    outputTokens: totalOutput,
-    cacheCreateTokens: cumulativeCache.cuCreated,
-    cacheReadTokens: cumulativeCache.cuRead,
+    inputTokens: cumulative.cuFresh,
+    outputTokens: cumulative.cuOutput,
+    cacheCreateTokens: cumulative.cuCreated,
+    cacheReadTokens: cumulative.cuRead,
   });
 
   // ── OMC Orchestration State ────────────────────────────────────────────
