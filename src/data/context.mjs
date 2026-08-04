@@ -30,7 +30,7 @@ import { checkOmcVersion, checkLensVersion } from './version-check.mjs';
 import { getScopedWeeklyLimits } from './usage-direct.mjs';
 import {
   readFileSync, writeFileSync, statSync, openSync, readSync, closeSync,
-  existsSync, renameSync, unlinkSync,
+  existsSync, renameSync, unlinkSync, readdirSync,
 } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -196,43 +196,70 @@ function scanTranscript(transcriptPath, kind, seed, apply) {
 }
 
 // ---------------------------------------------------------------------------
-// Cumulative usage accounting
+// Cumulative session statistics
 // ---------------------------------------------------------------------------
 
+/** Tool names that spawn a classic subagent. */
+const CLASSIC_AGENT_TOOLS = new Set(['Task', 'proxy_Task', 'Agent', 'proxy_Agent']);
+const SKILL_TOOLS = new Set(['Skill', 'proxy_Skill']);
+
 /**
- * Session-cumulative token usage, summed over every assistant message in the
- * transcript.
+ * Session-cumulative token usage and call counts, folded over the transcript.
  *
- * This is the only source of genuinely cumulative numbers. The stdin
- * `context_window` fields are NOT cumulative despite their names:
+ * Two separate defects are corrected here and they share a shape: a number
+ * that reads as "this session" but is not.
+ *
+ * The stdin `context_window` fields are not cumulative despite their names —
  * `total_input_tokens` is the size of the current prompt (it tracks the CTX
- * gauge exactly — 810.7k against a 1M window reads 81%), and
- * `total_output_tokens` is the last response alone. Feeding either into a
- * per-session total or a cost formula counts the wrong thing, so both the
- * token readout and the cost are computed from here instead.
+ * gauge exactly: 810.7k against a 1M window reads 81%) and
+ * `total_output_tokens` is the last response alone.
+ *
+ * OMC's parseTranscript does count tool, skill and agent calls, but reads only
+ * a 4MB tail, so once a session outgrows that the oldest calls fall out of the
+ * window and the counts silently shrink — measured at 185 of 245 real tool
+ * calls on a 5.3MB transcript, by which point the session's one Skill call had
+ * already dropped out and the counter read 0.
+ *
+ * Both are avoided by folding over the whole transcript incrementally. Usage
+ * and counts share one pass so that adding the counts costs no extra read.
  *
  * @param {string|null} transcriptPath
- * @returns {{ cuRead: number, cuCreated: number, cuFresh: number, cuOutput: number, cuHitRate: number }}
+ * @returns {{cuRead: number, cuCreated: number, cuFresh: number, cuOutput: number,
+ *            cuHitRate: number, toolCalls: number, skillCalls: number, agentCalls: number}}
  */
-function parseCumulativeUsageFromTranscript(transcriptPath) {
-  const result = { cuRead: 0, cuCreated: 0, cuFresh: 0, cuOutput: 0, cuHitRate: 0 };
+function parseSessionStatsFromTranscript(transcriptPath) {
+  const result = {
+    cuRead: 0, cuCreated: 0, cuFresh: 0, cuOutput: 0, cuHitRate: 0,
+    toolCalls: 0, skillCalls: 0, agentCalls: 0,
+  };
   if (!transcriptPath) return result;
 
-  // The record namespace is versioned: an older record predates cuOutput, and
-  // resuming from it would leave the output total permanently short by
-  // everything that came before this release.
+  // The record namespace is versioned: an older record predates these fields,
+  // and resuming from one would leave every total short by everything that
+  // came before this release.
   const data = scanTranscript(
     transcriptPath,
-    'usage2',
-    () => ({ cuRead: 0, cuCreated: 0, cuFresh: 0, cuOutput: 0 }),
+    'stats1',
+    () => ({
+      cuRead: 0, cuCreated: 0, cuFresh: 0, cuOutput: 0,
+      toolCalls: 0, skillCalls: 0, agentCalls: 0,
+    }),
     (acc, entry) => {
-      if (entry.type !== 'assistant') return;
-      const u = entry.message?.usage;
-      if (!u) return;
-      acc.cuRead += u.cache_read_input_tokens || 0;
-      acc.cuCreated += u.cache_creation_input_tokens || 0;
-      acc.cuFresh += u.input_tokens || 0;
-      acc.cuOutput += u.output_tokens || 0;
+      const usage = entry.type === 'assistant' ? entry.message?.usage : null;
+      if (usage) {
+        acc.cuRead += usage.cache_read_input_tokens || 0;
+        acc.cuCreated += usage.cache_creation_input_tokens || 0;
+        acc.cuFresh += usage.input_tokens || 0;
+        acc.cuOutput += usage.output_tokens || 0;
+      }
+      const content = entry.message?.content;
+      if (!Array.isArray(content)) return;
+      for (const block of content) {
+        if (block?.type !== 'tool_use') continue;
+        acc.toolCalls++;
+        if (SKILL_TOOLS.has(block.name)) acc.skillCalls++;
+        else if (CLASSIC_AGENT_TOOLS.has(block.name)) acc.agentCalls++;
+      }
     },
   );
   if (!data) return result;
@@ -241,9 +268,42 @@ function parseCumulativeUsageFromTranscript(transcriptPath) {
   result.cuCreated = data.cuCreated;
   result.cuFresh = data.cuFresh;
   result.cuOutput = data.cuOutput;
+  result.toolCalls = data.toolCalls;
+  result.skillCalls = data.skillCalls;
+  result.agentCalls = data.agentCalls;
   const denom = data.cuRead + data.cuCreated + data.cuFresh;
   result.cuHitRate = denom > 0 ? data.cuRead / denom : 0;
   return result;
+}
+
+/**
+ * Subagents spawned through the Workflow tool.
+ *
+ * These never appear as agent tool calls: one Workflow call fans out to many
+ * agents, so counting its tool_use blocks reports 2 where 23 ran, and the
+ * agents themselves run in their own transcripts. The run's artifacts are the
+ * real ledger — each agent leaves an `agent-<id>.jsonl` beside the workflow
+ * journal — so this reads the directory rather than the transcript.
+ *
+ * @param {string|null} transcriptPath
+ * @returns {number}
+ */
+function countWorkflowAgents(transcriptPath) {
+  if (!transcriptPath) return 0;
+  try {
+    const root = join(transcriptPath.replace(/\.jsonl$/, ''), 'subagents', 'workflows');
+    if (!existsSync(root)) return 0;
+    let count = 0;
+    for (const run of readdirSync(root, { withFileTypes: true })) {
+      if (!run.isDirectory()) continue;
+      for (const file of readdirSync(join(root, run.name))) {
+        if (file.startsWith('agent-') && file.endsWith('.jsonl')) count++;
+      }
+    }
+    return count;
+  } catch {
+    return 0;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -487,9 +547,15 @@ export async function assembleContext(options = {}) {
     todos = parseTasksFromTranscript(transcriptPath);
   }
   const lastActivatedSkill = txData?.lastActivatedSkill || undefined;
-  const toolCallCount = txData?.toolCallCount || 0;
-  const agentCallCount = txData?.agentCallCount || 0;
-  const skillCallCount = txData?.skillCallCount || 0;
+  // Counts and token totals both come from our own full-transcript fold rather
+  // than from OMC, which reads a 4MB tail and therefore reports counts that
+  // shrink as the oldest calls slide out of its window.
+  const stats = parseSessionStatsFromTranscript(transcriptPath);
+  const toolCallCount = stats.toolCalls;
+  const skillCallCount = stats.skillCalls;
+  // Workflow subagents are invisible to any transcript-based count — see
+  // countWorkflowAgents for why they have to be counted from the run's files.
+  const agentCallCount = stats.agentCalls + countWorkflowAgents(transcriptPath);
   const lastToolName = txData?.lastToolName || null;
   const thinkingState = txData?.thinkingState || undefined;
   const pendingPermission = txData?.pendingPermission || undefined;
@@ -518,19 +584,18 @@ export async function assembleContext(options = {}) {
   // than to zero.
   const cacheDenom = promptTokens || (cacheRead + cacheCreate);
   const cacheWriteReadSum = cacheRead + cacheCreate;
-  const cumulative = parseCumulativeUsageFromTranscript(transcriptPath);
   const tokens = {
-    inputTokens: cumulative.cuFresh,
-    outputTokens: cumulative.cuOutput,
+    inputTokens: stats.cuFresh,
+    outputTokens: stats.cuOutput,
     reasoningTokens: lastRequestTokenUsage?.reasoningTokens || null,
     // Clamped: a prompt total that lags the current_usage snapshot by a
     // request would otherwise read above 100%.
     cacheHitRate: cacheDenom > 0 ? Math.min(1, cacheRead / cacheDenom) : 0,
     cacheEfficiency: cacheWriteReadSum > 0 ? cacheRead / cacheWriteReadSum : 0,
-    cacheCumulativeHitRate: cumulative.cuHitRate,
+    cacheCumulativeHitRate: stats.cuHitRate,
     ...readCacheSnapshot(stdin?.session_id),
     sessionTotal:
-      (cumulative.cuFresh + cumulative.cuOutput + cumulative.cuRead + cumulative.cuCreated)
+      (stats.cuFresh + stats.cuOutput + stats.cuRead + stats.cuCreated)
       || sessionTotalTokens
       || 0,
   };
@@ -541,10 +606,10 @@ export async function assembleContext(options = {}) {
   // same tokens the cache-read term already covers, at ten times the rate —
   // while billing only the last response's output.
   const cost = calculateSessionCost(model, {
-    inputTokens: cumulative.cuFresh,
-    outputTokens: cumulative.cuOutput,
-    cacheCreateTokens: cumulative.cuCreated,
-    cacheReadTokens: cumulative.cuRead,
+    inputTokens: stats.cuFresh,
+    outputTokens: stats.cuOutput,
+    cacheCreateTokens: stats.cuCreated,
+    cacheReadTokens: stats.cuRead,
   });
 
   // ── OMC Orchestration State ────────────────────────────────────────────
