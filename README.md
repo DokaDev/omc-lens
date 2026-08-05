@@ -17,8 +17,8 @@ omc-lens is a visually enhanced statusline HUD for Claude Code, built on top of 
 - **Worktree**: active worktree shown in Line 1
 - **20-block 256-colour gradient context bar**: cyan-to-red fill with embedded percentage text; `COMPRESS?` and `CRITICAL` warnings at 80 % and 90 %
 - **Token usage**: input, output, session total, and reasoning token counts with compact K/M formatting
-- **Session cost**: cumulative USD cost formatted to four decimal places
-- **Tool, agent, and skill call counters**: wrench / robot / flash icons with running totals; last activated skill name
+- **Session cost**: cumulative USD cost, summed per model over the main thread and every subagent. Each model is billed at its own rate, so changing model mid-session does not reprice what earlier models already spent, and delegated work is not free — subagents write to their own transcripts, and counting only the main one understated the busiest local session by $807 of $822.
+- **Tool, agent, and skill call counters**: wrench / robot / flash icons with running totals
 - **Background task count**: live count of active background tasks
 - **Todo progress**: completed/total ratio with first in-progress item label (up to 30 characters)
 - **Vim mode indicator**: INSERT vs NORMAL with distinct colours

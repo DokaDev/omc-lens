@@ -154,3 +154,34 @@ export function calculateSessionCost(modelName, tokens) {
     1_000_000
   );
 }
+
+/**
+ * Sum cost over a per-model token breakdown.
+ *
+ * Charging a whole session at whichever model happens to be selected right now
+ * reprices every token already spent the moment the model changes. Across the
+ * local corpus that moved a session from $1204 to $710 (-41%) and another from
+ * $31 to $45 (+44%). It only bites when the two models sit in different rate
+ * rows — Opus 4.7 and 4.8 both bill at 5/25, so switching between them is free
+ * of error, while Fable (10/50) against Opus (5/25) is a 2x swing.
+ *
+ * The per-model shape uses short keys because it is written to the scan record
+ * on every render.
+ *
+ * @param {Record<string, {i?: number, o?: number, cc?: number, cr?: number}>|null} byModel
+ * @returns {number} Cost in USD
+ */
+export function calculateCostByModel(byModel) {
+  if (!byModel || typeof byModel !== 'object') return 0;
+  let total = 0;
+  for (const [modelName, t] of Object.entries(byModel)) {
+    if (!t) continue;
+    total += calculateSessionCost(modelName, {
+      inputTokens: t.i,
+      outputTokens: t.o,
+      cacheCreateTokens: t.cc,
+      cacheReadTokens: t.cr,
+    });
+  }
+  return total;
+}

@@ -25,7 +25,7 @@ import {
 } from '../lib/omc-bridge.mjs';
 
 import { getGitBranch, getGitStatusCounts } from './git.mjs';
-import { calculateSessionCost, getModelTier } from './cost.mjs';
+import { calculateCostByModel, getModelTier } from './cost.mjs';
 import { checkOmcVersion, checkLensVersion } from './version-check.mjs';
 import { getScopedWeeklyLimits } from './usage-direct.mjs';
 import {
@@ -137,7 +137,6 @@ function writeScanRecord(recordPath, record) {
  * @returns {T|null} the fold state, or null when the transcript is unreadable
  */
 function scanTranscript(transcriptPath, kind, seed, apply) {
-  let fd = null;
   try {
     const stat = statSync(transcriptPath);
     const recordPath = scanRecordPath(kind, transcriptPath);
@@ -147,41 +146,63 @@ function scanTranscript(transcriptPath, kind, seed, apply) {
     // in place, so the stored offset no longer points where it claims to.
     if (record && record.offset > stat.size) record = null;
 
-    let offset = record ? record.offset : 0;
+    const offset = record ? record.offset : 0;
     const data = record ? record.data : seed();
 
-    if (stat.size > offset) {
-      fd = openSync(transcriptPath, 'r');
-      const buf = Buffer.alloc(stat.size - offset);
-      const bytesRead = readSync(fd, buf, 0, buf.length, offset);
-      closeSync(fd);
-      fd = null;
-
-      // Stop at the final newline. The transcript is appended to while we read
-      // it, so the tail is routinely a half-written line; consuming it would
-      // both mis-parse and advance the offset past an entry that would then
-      // never be seen again. A newline byte never appears inside a multi-byte
-      // UTF-8 sequence either, so cutting there always leaves a decodable
-      // slice — and the offset consequently always sits at a line boundary.
-      const chunk = buf.subarray(0, bytesRead);
-      const lastNewline = chunk.lastIndexOf(0x0a);
-
-      if (lastNewline >= 0) {
-        const text = chunk.subarray(0, lastNewline + 1).toString('utf8');
-        for (const line of text.split('\n')) {
-          if (!line.trim()) continue;
-          try {
-            apply(data, JSON.parse(line));
-          } catch { /* skip malformed line */ }
-        }
-        offset += lastNewline + 1;
-        // Offset and state are written as a single record, so whichever of two
-        // concurrent renders writes last, the pair stays internally consistent
-        // and the next render resumes from a matching offset.
-        writeScanRecord(recordPath, { ino: stat.ino, offset, data });
-      }
+    const appended = foldAppended(transcriptPath, offset, stat.size, data, apply);
+    if (appended !== null) {
+      // Offset and state are written as a single record, so whichever of two
+      // concurrent renders writes last, the pair stays internally consistent
+      // and the next render resumes from a matching offset.
+      writeScanRecord(recordPath, { ino: stat.ino, offset: appended, data });
     }
     return data;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Apply `fold` to every complete entry appended to a file since `offset`.
+ *
+ * Shared by the transcript scan and the subagent-usage scan so the one subtle
+ * part — where it is safe to stop — has a single implementation.
+ *
+ * @param {string} path
+ * @param {number} offset  Byte offset the previous pass stopped at
+ * @param {number} size    Current file size, already stat'd by the caller
+ * @param {object} state   Fold state, mutated in place
+ * @param {(state: object, entry: object) => void} fold
+ * @returns {number|null}  New offset, or null when nothing whole was consumed
+ */
+function foldAppended(path, offset, size, state, fold) {
+  if (size <= offset) return null;
+  let fd = null;
+  try {
+    fd = openSync(path, 'r');
+    const buf = Buffer.alloc(size - offset);
+    const bytesRead = readSync(fd, buf, 0, buf.length, offset);
+    closeSync(fd);
+    fd = null;
+
+    // Stop at the final newline. The transcript is appended to while we read
+    // it, so the tail is routinely a half-written line; consuming it would
+    // both mis-parse and advance the offset past an entry that would then
+    // never be seen again. A newline byte never appears inside a multi-byte
+    // UTF-8 sequence either, so cutting there always leaves a decodable
+    // slice — and the offset consequently always sits at a line boundary.
+    const chunk = buf.subarray(0, bytesRead);
+    const lastNewline = chunk.lastIndexOf(0x0a);
+    if (lastNewline < 0) return null;
+
+    const text = chunk.subarray(0, lastNewline + 1).toString('utf8');
+    for (const line of text.split('\n')) {
+      if (!line.trim()) continue;
+      try {
+        fold(state, JSON.parse(line));
+      } catch { /* skip malformed line */ }
+    }
+    return offset + lastNewline + 1;
   } catch {
     return null;
   } finally {
@@ -202,6 +223,62 @@ function scanTranscript(transcriptPath, kind, seed, apply) {
 /** Tool names that spawn a classic subagent. */
 const CLASSIC_AGENT_TOOLS = new Set(['Task', 'proxy_Task', 'Agent', 'proxy_Agent']);
 const SKILL_TOOLS = new Set(['Skill', 'proxy_Skill']);
+
+/** Key for usage whose entry names no model; priced at the default tier. */
+const UNKNOWN_MODEL = '';
+
+/**
+ * Add one usage record to a per-model breakdown.
+ *
+ * Cost has to be summed per model rather than applied to a session total,
+ * because the rate that applies to a token is the rate of the model that spent
+ * it — not the rate of whatever model is selected when the HUD repaints. The
+ * short keys keep the scan record small, since it is rewritten every render.
+ *
+ * @param {Record<string, {i: number, o: number, cc: number, cr: number}>} byModel
+ * @param {unknown} model
+ * @param {object} usage
+ */
+function addUsageByModel(byModel, model, usage) {
+  const key = typeof model === 'string' && model !== '' ? model : UNKNOWN_MODEL;
+  const slot = byModel[key] || (byModel[key] = { i: 0, o: 0, cc: 0, cr: 0 });
+  slot.i += usage.input_tokens || 0;
+  slot.o += usage.output_tokens || 0;
+  slot.cc += usage.cache_creation_input_tokens || 0;
+  slot.cr += usage.cache_read_input_tokens || 0;
+}
+
+/**
+ * Re-key usage that named no model onto `model`, in place.
+ *
+ * Assistant entries in a current transcript all carry `message.model`, but the
+ * synthetic entries the CLI injects do not, and neither do older formats.
+ * Billing those at the default tier would silently misprice them; the model in
+ * use now is the better guess, and is what this figure used for everything
+ * before it became per-model.
+ *
+ * @param {Record<string, {i: number, o: number, cc: number, cr: number}>} byModel
+ * @param {string} model
+ */
+function billUnknownAs(byModel, model) {
+  const orphan = byModel[UNKNOWN_MODEL];
+  if (!orphan || model === UNKNOWN_MODEL) return byModel;
+  delete byModel[UNKNOWN_MODEL];
+  return mergeByModel(byModel, { [model]: orphan });
+}
+
+/** Merge one per-model breakdown into another, in place. */
+function mergeByModel(into, from) {
+  if (!from) return into;
+  for (const [model, t] of Object.entries(from)) {
+    const slot = into[model] || (into[model] = { i: 0, o: 0, cc: 0, cr: 0 });
+    slot.i += t.i || 0;
+    slot.o += t.o || 0;
+    slot.cc += t.cc || 0;
+    slot.cr += t.cr || 0;
+  }
+  return into;
+}
 
 /**
  * Session-cumulative token usage and call counts, folded over the transcript.
@@ -230,7 +307,7 @@ const SKILL_TOOLS = new Set(['Skill', 'proxy_Skill']);
 function parseSessionStatsFromTranscript(transcriptPath) {
   const result = {
     cuRead: 0, cuCreated: 0, cuFresh: 0, cuOutput: 0, cuHitRate: 0,
-    toolCalls: 0, skillCalls: 0, agentCalls: 0,
+    toolCalls: 0, skillCalls: 0, agentCalls: 0, byModel: {},
   };
   if (!transcriptPath) return result;
 
@@ -239,10 +316,10 @@ function parseSessionStatsFromTranscript(transcriptPath) {
   // came before this release.
   const data = scanTranscript(
     transcriptPath,
-    'stats1',
+    'stats2',
     () => ({
       cuRead: 0, cuCreated: 0, cuFresh: 0, cuOutput: 0,
-      toolCalls: 0, skillCalls: 0, agentCalls: 0,
+      toolCalls: 0, skillCalls: 0, agentCalls: 0, byModel: {},
     }),
     (acc, entry) => {
       const usage = entry.type === 'assistant' ? entry.message?.usage : null;
@@ -251,6 +328,7 @@ function parseSessionStatsFromTranscript(transcriptPath) {
         acc.cuCreated += usage.cache_creation_input_tokens || 0;
         acc.cuFresh += usage.input_tokens || 0;
         acc.cuOutput += usage.output_tokens || 0;
+        addUsageByModel(acc.byModel, entry.message?.model, usage);
       }
       const content = entry.message?.content;
       if (!Array.isArray(content)) return;
@@ -271,6 +349,7 @@ function parseSessionStatsFromTranscript(transcriptPath) {
   result.toolCalls = data.toolCalls;
   result.skillCalls = data.skillCalls;
   result.agentCalls = data.agentCalls;
+  result.byModel = data.byModel || {};
   const denom = data.cuRead + data.cuCreated + data.cuFresh;
   result.cuHitRate = denom > 0 ? data.cuRead / denom : 0;
   return result;
@@ -303,6 +382,109 @@ function countWorkflowAgents(transcriptPath) {
     return count;
   } catch {
     return 0;
+  }
+}
+
+/**
+ * Runaway guard, not a real ceiling — the busiest session in the local corpus
+ * spawned 332 subagents. Hitting this would undercount cost silently, so it is
+ * set far above any plausible run.
+ */
+const SUBAGENT_SCAN_LIMIT = 2000;
+
+/** Every `.jsonl` beneath a session's `subagents/` tree, at any depth. */
+function subagentTranscripts(transcriptPath) {
+  const out = [];
+  const stack = [join(transcriptPath.replace(/\.jsonl$/, ''), 'subagents')];
+  while (stack.length > 0 && out.length < SUBAGENT_SCAN_LIMIT) {
+    const dir = stack.pop();
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue; // Not a directory, or gone since the parent was listed.
+    }
+    for (const entry of entries) {
+      const path = join(dir, entry.name);
+      if (entry.isDirectory()) stack.push(path);
+      else if (entry.name.endsWith('.jsonl')) out.push(path);
+    }
+  }
+  return out;
+}
+
+/**
+ * Per-model token usage spent by this session's subagents.
+ *
+ * Subagents bill to the session but write to their own transcripts, so a fold
+ * over the main transcript alone misses every token they spent. Measured across
+ * the local corpus that is a 19% understatement in aggregate, and far worse on
+ * delegation-heavy sessions: one showed $14.83 while its 332 agents had spent
+ * $807.45. They also run on their own models — haiku and sonnet alongside the
+ * main thread's opus — which is why this returns a per-model breakdown rather
+ * than a total.
+ *
+ * One record holds every file's offset, so a repaint costs a stat() per
+ * subagent transcript and reads only what has been appended. Per-file totals
+ * are kept separately so a rewritten file can be recomputed without having to
+ * unpick its old contribution from a shared sum.
+ *
+ * @param {string|null} transcriptPath
+ * @returns {Record<string, {i: number, o: number, cc: number, cr: number}>}
+ */
+function scanSubagentUsage(transcriptPath) {
+  if (!transcriptPath) return {};
+  try {
+    const paths = subagentTranscripts(transcriptPath);
+    if (paths.length === 0) return {};
+
+    const recordPath = scanRecordPath('subusage1', transcriptPath);
+    let previous = {};
+    try {
+      const raw = JSON.parse(readFileSync(recordPath, 'utf8'));
+      if (raw && raw.files && typeof raw.files === 'object') previous = raw.files;
+    } catch {
+      // No usable record: every file is read from the start this once.
+    }
+
+    const files = {};
+    let changed = Object.keys(previous).length !== paths.length;
+
+    for (const path of paths) {
+      let stat;
+      try {
+        stat = statSync(path);
+      } catch {
+        continue;
+      }
+      const prior = previous[path];
+      // Same inode and an offset still inside the file means the stored totals
+      // describe a prefix of what is there now, so they can be resumed.
+      const resumable = prior && prior.ino === stat.ino && prior.offset <= stat.size;
+      if (!resumable) changed = true;
+      const entry = resumable
+        ? { ino: prior.ino, offset: prior.offset, byModel: prior.byModel || {} }
+        : { ino: stat.ino, offset: 0, byModel: {} };
+
+      const advanced = foldAppended(path, entry.offset, stat.size, entry, (acc, line) => {
+        if (line.type !== 'assistant') return;
+        const usage = line.message?.usage;
+        if (usage) addUsageByModel(acc.byModel, line.message?.model, usage);
+      });
+      if (advanced !== null) {
+        entry.offset = advanced;
+        changed = true;
+      }
+      files[path] = entry;
+    }
+
+    if (changed) writeScanRecord(recordPath, { files });
+
+    const total = {};
+    for (const entry of Object.values(files)) mergeByModel(total, entry.byModel);
+    return total;
+  } catch {
+    return {};
   }
 }
 
@@ -605,12 +787,22 @@ export async function assembleContext(options = {}) {
   // fields here billed the current prompt as if it were fresh input — the
   // same tokens the cache-read term already covers, at ten times the rate —
   // while billing only the last response's output.
-  const cost = calculateSessionCost(model, {
-    inputTokens: stats.cuFresh,
-    outputTokens: stats.cuOutput,
-    cacheCreateTokens: stats.cuCreated,
-    cacheReadTokens: stats.cuRead,
-  });
+  //
+  // Cost is summed per model over the main thread *and* every subagent, which
+  // is deliberately wider than the ↓/↑/Σ readout above. Those describe this
+  // conversation's own token flow, and folding subagents into them would make
+  // the hr/cu rates beside them meaningless — they would average cache
+  // behaviour across models that never shared a cache. Cost has no such
+  // problem: it is the one figure where the question is simply what the
+  // session spent, and a subagent's tokens are spent just the same.
+  //
+  // Merging into a fresh object rather than into stats.byModel matters: the
+  // slot objects there belong to the scan record's fold state, and adding the
+  // subagent totals to them in place would double them on the next render.
+  const costByModel = mergeByModel({}, stats.byModel);
+  mergeByModel(costByModel, scanSubagentUsage(transcriptPath));
+  billUnknownAs(costByModel, model);
+  const cost = calculateCostByModel(costByModel);
 
   // ── OMC Orchestration State ────────────────────────────────────────────
   const ralph = safeCall(() => readRalphStateForHud(cwd), null);
