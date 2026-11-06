@@ -157,6 +157,9 @@ export function renderLine2(ctx) {
     const outputT = fmtTokens(tokens.outputTokens || 0);
     const sessionT = fmtTokens(tokens.sessionTotal || 0);
     let s = `${fg256(255, getIcon('token'))} ${fg256(81, '\u2193')}${fg256(255, inputT)} ${fg256(171, '\u2191')}${fg256(255, outputT)} ${fg256(114, '\u03A3')}${fg256(255, sessionT)}`;
+    // A trailing dim ellipsis marks totals still catching up on a transcript
+    // too large to scan in one render.
+    if (ctx.scanPartial) s += dim('\u2026');
     if (tokens.reasoningTokens) {
       s += ` ${fg256(208, `R${fmtTokens(tokens.reasoningTokens)}`)}`;
     }
@@ -164,7 +167,7 @@ export function renderLine2(ctx) {
   });
 
   const seg3 = trySegment('cost', () =>
-    `${fg256(226, getIcon('cost'))} ${fg256(255, formatCost(ctx.cost || 0))}`
+    `${fg256(226, getIcon('cost'))} ${fg256(255, formatCost(ctx.cost || 0))}${ctx.scanPartial ? dim('\u2026') : ''}`
   );
 
   const seg4 = trySegment('counters', () => {

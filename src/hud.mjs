@@ -63,11 +63,20 @@ async function main() {
       termWidth,
     });
 
-    process.stdout.write(output);
+    process.stdout.write(output, exitNow);
   } catch (err) {
     // Never crash — output minimal fallback
-    process.stdout.write(`\x1b[90mHUD error: ${err.message || 'unknown'}\x1b[0m\n`);
+    process.stdout.write(`\x1b[90mHUD error: ${err.message || 'unknown'}\x1b[0m\n`, exitNow);
   }
+}
+
+/**
+ * Exit as soon as the output is flushed. A network fetch that lost its race
+ * against the render deadline is still pending, and its own timeout would
+ * otherwise keep the process alive for seconds after the HUD is written.
+ */
+function exitNow() {
+  process.exit(0);
 }
 
 main();

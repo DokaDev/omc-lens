@@ -41,7 +41,9 @@ import { join } from 'node:path';
 const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
 const OAUTH_BETA = 'oauth-2025-04-20';
 const FETCH_TIMEOUT_MS = 3000;
-const KEYCHAIN_TIMEOUT_MS = 2000;
+// A Keychain read is synchronous and cannot be raced against the render
+// deadline, so it gets a tight timeout of its own; a normal read takes ~30ms.
+const KEYCHAIN_TIMEOUT_MS = 500;
 
 // Machine-wide on purpose — see the module header. Every session shares one
 // entry so N concurrent sessions still cost one request per TTL, not N.

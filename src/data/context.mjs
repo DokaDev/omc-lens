@@ -67,6 +67,96 @@ function readCacheSnapshot(sessionId) {
 // ---------------------------------------------------------------------------
 
 /**
+ * Wall-clock allowance for one whole render, in ms, counted from process start.
+ *
+ * Transcript scans stop once this much time has passed since the process
+ * launched (bridge init, stdin and OMC's tail read all count against it), so
+ * the render as a whole — not just the scans — stays well inside Claude Code's
+ * refresh window. Override with OMC_LENS_SCAN_BUDGET_MS.
+ *
+ * Claude Code cancels a statusline command that is still running when the next
+ * refresh fires (every couple of seconds, sooner on events), and this process
+ * writes nothing until it has assembled everything. A first pass over a
+ * 100MB+ transcript takes several seconds, so without a cap every render was
+ * killed mid-scan, nothing was ever printed, and — because progress was only
+ * saved at the end — each new render started again from byte 0. Scans stop
+ * here instead, save where they got to, and the HUD renders with what it has;
+ * the next render picks up from the saved offset.
+ */
+const RENDER_BUDGET_MS = Number(process.env.OMC_LENS_SCAN_BUDGET_MS) > 0
+  ? Number(process.env.OMC_LENS_SCAN_BUDGET_MS)
+  : 500;
+
+/**
+ * Scan time granted even when startup alone used up the render budget, so a
+ * slow machine still advances the saved offsets on every render instead of
+ * never making progress at all.
+ */
+const MIN_SCAN_SLICE_MS = 150;
+
+/** How often a long scan saves its progress, so even a killed render advances the next. */
+const CHECKPOINT_MS = Number(process.env.OMC_LENS_SCAN_CHECKPOINT_MS || 200) >= 0
+  ? Number(process.env.OMC_LENS_SCAN_CHECKPOINT_MS || 200)
+  : 200;
+
+/**
+ * Wrap a save so it runs at most once per CHECKPOINT_MS, however often called.
+ * @param {(offset: number) => void} save
+ * @returns {(offset: number) => void}
+ */
+function throttled(save) {
+  let last = Date.now();
+  return (offset) => {
+    if (Date.now() - last < CHECKPOINT_MS) return;
+    save(offset);
+    last = Date.now();
+  };
+}
+
+/** Bytes read per step; a line longer than this widens the window. */
+const READ_CHUNK_BYTES = 1024 * 1024;
+
+/**
+ * A scan budget shared by every scan in one render.
+ * `cut` turns true once any scan had to stop before reaching the end.
+ *
+ * With no argument the deadline is RENDER_BUDGET_MS after process start, but
+ * never less than MIN_SCAN_SLICE_MS from now. With `ms`, it is `ms` from now.
+ *
+ * @param {number} [ms]
+ * @returns {{deadline: number, cut: boolean}}
+ */
+export function createScanBudget(ms) {
+  const now = Date.now();
+  const deadline = ms === undefined
+    ? Math.max(performance.timeOrigin + RENDER_BUDGET_MS, now + MIN_SCAN_SLICE_MS)
+    : now + ms;
+  return { deadline, cut: false };
+}
+
+/**
+ * Remove scan-record temp files a killed render left between write and rename.
+ * Only ones over a minute old, so a concurrent render's live temp is never hit.
+ */
+export function sweepStaleScanTemps() {
+  try {
+    const dir = tmpdir();
+    const cutoff = Date.now() - 60 * 1000;
+    for (const name of readdirSync(dir)) {
+      if (!name.startsWith('omc-lens-scan-') || !name.endsWith('.tmp')) continue;
+      try {
+        const p = join(dir, name);
+        if (statSync(p).mtimeMs < cutoff) unlinkSync(p);
+      } catch {
+        // Gone already, or not ours to remove.
+      }
+    }
+  } catch {
+    // Cleanup is best-effort.
+  }
+}
+
+/**
  * Path of the resume record for one transcript under one kind of scan.
  *
  * A fresh process runs on every statusline repaint, so this state has to live
@@ -129,14 +219,20 @@ function writeScanRecord(recordPath, record) {
  * only the newly appended bytes. A multi-tens-of-MB transcript costs one full
  * pass on a session's first render and a few KB on every render after.
  *
+ * That first pass is bounded by `budget` and saved every CHECKPOINT_MS along
+ * the way, so on a transcript too large to finish in one render the work is
+ * spread over several, and a render killed mid-scan still moves the next one
+ * forward. The state returned after a cut describes a prefix of the file.
+ *
  * @template T
  * @param {string} transcriptPath
  * @param {string} kind                              Record namespace
  * @param {() => T} seed                             Fresh state when starting over
  * @param {(state: T, entry: object) => void} apply  Called per entry, in order
+ * @param {{deadline: number, cut: boolean}} [budget]
  * @returns {T|null} the fold state, or null when the transcript is unreadable
  */
-function scanTranscript(transcriptPath, kind, seed, apply) {
+export function scanTranscript(transcriptPath, kind, seed, apply, budget = createScanBudget(Infinity)) {
   try {
     const stat = statSync(transcriptPath);
     const recordPath = scanRecordPath(kind, transcriptPath);
@@ -149,13 +245,12 @@ function scanTranscript(transcriptPath, kind, seed, apply) {
     const offset = record ? record.offset : 0;
     const data = record ? record.data : seed();
 
-    const appended = foldAppended(transcriptPath, offset, stat.size, data, apply);
-    if (appended !== null) {
-      // Offset and state are written as a single record, so whichever of two
-      // concurrent renders writes last, the pair stays internally consistent
-      // and the next render resumes from a matching offset.
-      writeScanRecord(recordPath, { ino: stat.ino, offset: appended, data });
-    }
+    // Offset and state are always written as a single record, so whichever of
+    // two concurrent renders writes last, the pair stays internally consistent
+    // and the next render resumes from a matching offset.
+    const save = (at) => writeScanRecord(recordPath, { ino: stat.ino, offset: at, data });
+    const appended = foldAppended(transcriptPath, offset, stat.size, data, apply, budget, throttled(save));
+    if (appended !== null) save(appended);
     return data;
   } catch {
     return null;
@@ -168,43 +263,68 @@ function scanTranscript(transcriptPath, kind, seed, apply) {
  * Shared by the transcript scan and the subagent-usage scan so the one subtle
  * part — where it is safe to stop — has a single implementation.
  *
+ * The file is read a chunk at a time rather than in one allocation, which both
+ * keeps memory flat on a 100MB+ transcript and gives natural points to check
+ * the budget and save progress. Each stop is at a line boundary with every
+ * line before it folded in, so any offset handed to `checkpoint` or returned
+ * pairs exactly with the state at that moment.
+ *
  * @param {string} path
  * @param {number} offset  Byte offset the previous pass stopped at
  * @param {number} size    Current file size, already stat'd by the caller
  * @param {object} state   Fold state, mutated in place
  * @param {(state: object, entry: object) => void} fold
+ * @param {{deadline: number, cut: boolean}} [budget]  `cut` is set when stopping early
+ * @param {((offset: number) => void)|null} [checkpoint]  Called after every chunk; throttle it
  * @returns {number|null}  New offset, or null when nothing whole was consumed
  */
-function foldAppended(path, offset, size, state, fold) {
+function foldAppended(path, offset, size, state, fold, budget = createScanBudget(Infinity), checkpoint = null) {
   if (size <= offset) return null;
   let fd = null;
+  let pos = offset;
   try {
     fd = openSync(path, 'r');
-    const buf = Buffer.alloc(size - offset);
-    const bytesRead = readSync(fd, buf, 0, buf.length, offset);
-    closeSync(fd);
-    fd = null;
+    let want = READ_CHUNK_BYTES;
+    while (pos < size) {
+      if (Date.now() >= budget.deadline) {
+        budget.cut = true;
+        break;
+      }
+      const len = Math.min(want, size - pos);
+      const buf = Buffer.allocUnsafe(len);
+      const bytesRead = readSync(fd, buf, 0, len, pos);
 
-    // Stop at the final newline. The transcript is appended to while we read
-    // it, so the tail is routinely a half-written line; consuming it would
-    // both mis-parse and advance the offset past an entry that would then
-    // never be seen again. A newline byte never appears inside a multi-byte
-    // UTF-8 sequence either, so cutting there always leaves a decodable
-    // slice — and the offset consequently always sits at a line boundary.
-    const chunk = buf.subarray(0, bytesRead);
-    const lastNewline = chunk.lastIndexOf(0x0a);
-    if (lastNewline < 0) return null;
+      // Stop at the final newline. The transcript is appended to while we
+      // read it, so the tail is routinely a half-written line; consuming it
+      // would both mis-parse and advance the offset past an entry that would
+      // then never be seen again. A newline byte never appears inside a
+      // multi-byte UTF-8 sequence either, so cutting there always leaves a
+      // decodable slice — and the offset consequently always sits at a line
+      // boundary.
+      const chunk = buf.subarray(0, bytesRead);
+      const lastNewline = chunk.lastIndexOf(0x0a);
+      if (lastNewline < 0) {
+        // Either the unterminated tail, or one line longer than the window
+        // (inline images make multi-MB lines): widen and read again.
+        if (bytesRead < len || pos + bytesRead >= size) break;
+        want *= 2;
+        continue;
+      }
+      want = READ_CHUNK_BYTES;
 
-    const text = chunk.subarray(0, lastNewline + 1).toString('utf8');
-    for (const line of text.split('\n')) {
-      if (!line.trim()) continue;
-      try {
-        fold(state, JSON.parse(line));
-      } catch { /* skip malformed line */ }
+      const text = chunk.subarray(0, lastNewline + 1).toString('utf8');
+      for (const line of text.split('\n')) {
+        if (!line.trim()) continue;
+        try {
+          fold(state, JSON.parse(line));
+        } catch { /* skip malformed line */ }
+      }
+      pos += lastNewline + 1;
+
+      if (checkpoint) checkpoint(pos);
     }
-    return offset + lastNewline + 1;
   } catch {
-    return null;
+    // A read failed: everything before `pos` was folded, so it still stands.
   } finally {
     if (fd !== null) {
       try {
@@ -214,6 +334,7 @@ function foldAppended(path, offset, size, state, fold) {
       }
     }
   }
+  return pos > offset ? pos : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -280,6 +401,34 @@ function mergeByModel(into, from) {
   return into;
 }
 
+/** Fresh fold state for parseSessionStatsFromTranscript. */
+export function seedSessionStats() {
+  return {
+    cuRead: 0, cuCreated: 0, cuFresh: 0, cuOutput: 0,
+    toolCalls: 0, skillCalls: 0, agentCalls: 0, byModel: {},
+  };
+}
+
+/** Fold one transcript entry into the session statistics. */
+export function applySessionStatsEntry(acc, entry) {
+  const usage = entry.type === 'assistant' ? entry.message?.usage : null;
+  if (usage) {
+    acc.cuRead += usage.cache_read_input_tokens || 0;
+    acc.cuCreated += usage.cache_creation_input_tokens || 0;
+    acc.cuFresh += usage.input_tokens || 0;
+    acc.cuOutput += usage.output_tokens || 0;
+    addUsageByModel(acc.byModel, entry.message?.model, usage);
+  }
+  const content = entry.message?.content;
+  if (!Array.isArray(content)) return;
+  for (const block of content) {
+    if (block?.type !== 'tool_use') continue;
+    acc.toolCalls++;
+    if (SKILL_TOOLS.has(block.name)) acc.skillCalls++;
+    else if (CLASSIC_AGENT_TOOLS.has(block.name)) acc.agentCalls++;
+  }
+}
+
 /**
  * Session-cumulative token usage and call counts, folded over the transcript.
  *
@@ -301,10 +450,11 @@ function mergeByModel(into, from) {
  * and counts share one pass so that adding the counts costs no extra read.
  *
  * @param {string|null} transcriptPath
+ * @param {{deadline: number, cut: boolean}} [budget]
  * @returns {{cuRead: number, cuCreated: number, cuFresh: number, cuOutput: number,
  *            cuHitRate: number, toolCalls: number, skillCalls: number, agentCalls: number}}
  */
-function parseSessionStatsFromTranscript(transcriptPath) {
+export function parseSessionStatsFromTranscript(transcriptPath, budget) {
   const result = {
     cuRead: 0, cuCreated: 0, cuFresh: 0, cuOutput: 0, cuHitRate: 0,
     toolCalls: 0, skillCalls: 0, agentCalls: 0, byModel: {},
@@ -314,32 +464,7 @@ function parseSessionStatsFromTranscript(transcriptPath) {
   // The record namespace is versioned: an older record predates these fields,
   // and resuming from one would leave every total short by everything that
   // came before this release.
-  const data = scanTranscript(
-    transcriptPath,
-    'stats2',
-    () => ({
-      cuRead: 0, cuCreated: 0, cuFresh: 0, cuOutput: 0,
-      toolCalls: 0, skillCalls: 0, agentCalls: 0, byModel: {},
-    }),
-    (acc, entry) => {
-      const usage = entry.type === 'assistant' ? entry.message?.usage : null;
-      if (usage) {
-        acc.cuRead += usage.cache_read_input_tokens || 0;
-        acc.cuCreated += usage.cache_creation_input_tokens || 0;
-        acc.cuFresh += usage.input_tokens || 0;
-        acc.cuOutput += usage.output_tokens || 0;
-        addUsageByModel(acc.byModel, entry.message?.model, usage);
-      }
-      const content = entry.message?.content;
-      if (!Array.isArray(content)) return;
-      for (const block of content) {
-        if (block?.type !== 'tool_use') continue;
-        acc.toolCalls++;
-        if (SKILL_TOOLS.has(block.name)) acc.skillCalls++;
-        else if (CLASSIC_AGENT_TOOLS.has(block.name)) acc.agentCalls++;
-      }
-    },
-  );
+  const data = scanTranscript(transcriptPath, 'stats2', seedSessionStats, applySessionStatsEntry, budget);
   if (!data) return result;
 
   result.cuRead = data.cuRead;
@@ -429,10 +554,14 @@ function subagentTranscripts(transcriptPath) {
  * are kept separately so a rewritten file can be recomputed without having to
  * unpick its old contribution from a shared sum.
  *
+ * Shares the render's scan budget: files it has no time left for keep their
+ * previous offsets, and progress is saved every CHECKPOINT_MS during the loop.
+ *
  * @param {string|null} transcriptPath
+ * @param {{deadline: number, cut: boolean}} [budget]
  * @returns {Record<string, {i: number, o: number, cc: number, cr: number}>}
  */
-function scanSubagentUsage(transcriptPath) {
+export function scanSubagentUsage(transcriptPath, budget = createScanBudget(Infinity)) {
   if (!transcriptPath) return {};
   try {
     const paths = subagentTranscripts(transcriptPath);
@@ -449,6 +578,11 @@ function scanSubagentUsage(transcriptPath) {
 
     const files = {};
     let changed = Object.keys(previous).length !== paths.length;
+    // One throttle across the whole loop: most subagent transcripts are small,
+    // so a per-file timer would never fire. A mid-scan save keeps the prior
+    // entries of files not reached yet, so a render killed partway through
+    // loses none of what earlier ones did.
+    const saveAll = throttled(() => writeScanRecord(recordPath, { files: { ...previous, ...files } }));
 
     for (const path of paths) {
       let stat;
@@ -460,22 +594,27 @@ function scanSubagentUsage(transcriptPath) {
       const prior = previous[path];
       // Same inode and an offset still inside the file means the stored totals
       // describe a prefix of what is there now, so they can be resumed.
-      const resumable = prior && prior.ino === stat.ino && prior.offset <= stat.size;
+      const resumable = prior && prior.ino === stat.ino
+        && Number.isInteger(prior.offset) && prior.offset >= 0 && prior.offset <= stat.size;
       if (!resumable) changed = true;
       const entry = resumable
         ? { ino: prior.ino, offset: prior.offset, byModel: prior.byModel || {} }
         : { ino: stat.ino, offset: 0, byModel: {} };
 
+      files[path] = entry;
+      const save = (at) => {
+        entry.offset = at;
+        saveAll();
+      };
       const advanced = foldAppended(path, entry.offset, stat.size, entry, (acc, line) => {
         if (line.type !== 'assistant') return;
         const usage = line.message?.usage;
         if (usage) addUsageByModel(acc.byModel, line.message?.model, usage);
-      });
+      }, budget, save);
       if (advanced !== null) {
-        entry.offset = advanced;
+        save(advanced);
         changed = true;
       }
-      files[path] = entry;
     }
 
     if (changed) writeScanRecord(recordPath, { files });
@@ -601,9 +740,10 @@ function applyTaskEntry(state, entry) {
  * is the sole source for the Line 2 counter.
  *
  * @param {string|null} transcriptPath
+ * @param {{deadline: number, cut: boolean}} [budget]
  * @returns {Array<{content: string, status: string}>}
  */
-function parseTasksFromTranscript(transcriptPath) {
+export function parseTasksFromTranscript(transcriptPath, budget) {
   if (!transcriptPath) return [];
 
   const data = scanTranscript(
@@ -611,6 +751,7 @@ function parseTasksFromTranscript(transcriptPath) {
     'tasks',
     () => ({ maxNum: 0, tasks: {}, pending: {} }),
     applyTaskEntry,
+    budget,
   );
   if (!data) return [];
 
@@ -618,6 +759,77 @@ function parseTasksFromTranscript(transcriptPath) {
     .map(Number)
     .sort((a, b) => a - b)
     .map((n) => ({ content: data.tasks[n].content, status: data.tasks[n].status }));
+}
+
+// ---------------------------------------------------------------------------
+// Network deadline
+// ---------------------------------------------------------------------------
+
+/**
+ * Latest moment, in ms after process start, that network work may finish.
+ * Enough for a healthy cold fetch (~200-400ms, run concurrently) after a scan
+ * slice, and well inside the ~2s after which Claude Code kills the command.
+ */
+const NETWORK_DEADLINE_MS = 800;
+
+/** How long a lost race keeps every render off the network. */
+const NETWORK_STALL_BACKOFF_MS = 30 * 1000;
+
+const TIMED_OUT = Symbol('timed out');
+
+/**
+ * Settle with `promise`, or with TIMED_OUT once `deadline` (epoch ms) passes.
+ * The losing promise is abandoned; hud.mjs exits explicitly once it has
+ * written, so a pending fetch cannot keep the process alive.
+ */
+function withDeadline(promise, deadline) {
+  let timer;
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(TIMED_OUT), Math.max(0, deadline - Date.now()));
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+function networkStallPath() {
+  return join(tmpdir(), 'omc-lens-network-stalled');
+}
+
+/** True while a recent render lost its race against the network deadline. */
+function networkStalled() {
+  try {
+    return Date.now() - statSync(networkStallPath()).mtimeMs < NETWORK_STALL_BACKOFF_MS;
+  } catch {
+    return false;
+  }
+}
+
+function markNetworkStalled() {
+  try { writeFileSync(networkStallPath(), ''); } catch {}
+}
+
+function clearNetworkStalled() {
+  try { unlinkSync(networkStallPath()); } catch {}
+}
+
+/**
+ * Usage-API rate limits merged with the model-scoped weekly windows, fetched
+ * concurrently.
+ * @returns {Promise<{rateLimits: object|null, rateLimitError: string|undefined}>}
+ */
+async function fetchRateLimits() {
+  const [usageResult, scoped] = await Promise.all([
+    getUsage().catch(() => ({ rateLimits: null, error: 'fetch_error' })),
+    // Model-scoped weekly windows (Fable/Sonnet/Opus). OMC still reads the
+    // legacy seven_day_<model> keys, which Anthropic now returns null for
+    // after moving those windows into the response's `limits` array, so it no
+    // longer produces these buckets. Fetch them separately and let anything
+    // OMC did produce win — an OMC release that learns `limits[]` then takes
+    // over silently, with no change needed here.
+    getScopedWeeklyLimits().catch(() => null),
+  ]);
+  let rateLimits = usageResult?.rateLimits || null;
+  if (scoped) rateLimits = { ...scoped, ...(rateLimits || {}) };
+  return { rateLimits, rateLimitError: usageResult?.error || undefined };
 }
 
 // ---------------------------------------------------------------------------
@@ -666,6 +878,7 @@ let _previousStdin = null;
  * @property {Object|null} lastRequestTokenUsage Last request token usage
  * @property {string|null} omcVersion            OMC plugin version
  * @property {boolean} omcAvailable              Whether OMC modules loaded
+ * @property {boolean} scanPartial               Token/cost/count totals still catching up
  */
 
 /**
@@ -724,15 +937,23 @@ export async function assembleContext(options = {}) {
   const agents = txData?.agents || [];
   let todos = txData?.todos || [];
 
-  // Fallback: if OMC TodoWrite-based todos are empty, try TaskCreate/TaskUpdate
-  if (todos.length === 0 && transcriptPath) {
-    todos = parseTasksFromTranscript(transcriptPath);
-  }
-  const lastActivatedSkill = txData?.lastActivatedSkill || undefined;
+  // One budget for every transcript scan below, counted from process start.
+  // Scans run in order of what matters most when the budget is short: token
+  // totals, then subagent spend (both feed the cost), then the task list.
+  const scanBudget = createScanBudget();
+  sweepStaleScanTemps();
+
   // Counts and token totals both come from our own full-transcript fold rather
   // than from OMC, which reads a 4MB tail and therefore reports counts that
   // shrink as the oldest calls slide out of its window.
-  const stats = parseSessionStatsFromTranscript(transcriptPath);
+  const stats = parseSessionStatsFromTranscript(transcriptPath, scanBudget);
+  const subagentUsage = scanSubagentUsage(transcriptPath, scanBudget);
+
+  // Fallback: if OMC TodoWrite-based todos are empty, try TaskCreate/TaskUpdate
+  if (todos.length === 0 && transcriptPath) {
+    todos = parseTasksFromTranscript(transcriptPath, scanBudget);
+  }
+  const lastActivatedSkill = txData?.lastActivatedSkill || undefined;
   const toolCallCount = stats.toolCalls;
   const skillCallCount = stats.skillCalls;
   // Workflow subagents are invisible to any transcript-based count — see
@@ -744,6 +965,85 @@ export async function assembleContext(options = {}) {
   const sessionStart = txData?.sessionStart || undefined;
   const lastRequestTokenUsage = txData?.lastRequestTokenUsage || null;
   const sessionTotalTokens = txData?.sessionTotalTokens || null;
+
+  // ── Network: rate limits and version checks ────────────────────────────
+  // Runs after the scans, so their checkpoints are already on disk, and is
+  // raced against an absolute deadline: the underlying fetches carry their own
+  // 2-10s timeouts, far past Claude Code's refresh window, and a stalled
+  // network must never hold back the render. Whatever has not settled by the
+  // deadline is dropped in favour of the last cached value.
+  const netStalled = networkStalled();
+  const netDeadline = netStalled ? Date.now() : performance.timeOrigin + NETWORK_DEADLINE_MS;
+
+  // ── Rate Limits (throttled fetch + file-based cache) ───────────────────
+  // The usage API has its own rate limit — calling it every ~300ms render
+  // cycle quickly exhausts it. Only fetch when cache is stale (>60s).
+  let rateLimits = null;
+  let rateLimitError = undefined;
+  const _rlCachePath = join(tmpdir(), `omc-lens-ratelimit-cache-${stdin?.session_id || 'default'}.json`);
+  const _rlCacheTtlMs = 60 * 1000; // 60 seconds
+  let _rlCacheHit = false;
+  try {
+    if (existsSync(_rlCachePath)) {
+      const _rlStat = statSync(_rlCachePath);
+      const _rlAge = Date.now() - _rlStat.mtimeMs;
+      if (_rlAge < _rlCacheTtlMs) {
+        rateLimits = JSON.parse(readFileSync(_rlCachePath, 'utf8'));
+        _rlCacheHit = true;
+      }
+    }
+  } catch {}
+  if (!_rlCacheHit) {
+    // While the network is marked stalled the fetch is skipped outright —
+    // not merely raced — because it starts with a synchronous Keychain read.
+    // Marked stalled up front and cleared only on success, so a render killed
+    // while waiting on the network still backs the next ones off.
+    if (!netStalled) markNetworkStalled();
+    const fetched = netStalled ? TIMED_OUT : await withDeadline(fetchRateLimits(), netDeadline);
+    if (fetched === TIMED_OUT) {
+      rateLimitError = 'timeout';
+    } else {
+      ({ rateLimits, rateLimitError } = fetched);
+    }
+    if (rateLimits) {
+      try { writeFileSync(_rlCachePath, JSON.stringify(rateLimits), 'utf8'); } catch {}
+    }
+    // Fallback: read stale cache if fetch failed
+    if (!rateLimits) {
+      try {
+        if (existsSync(_rlCachePath)) {
+          rateLimits = JSON.parse(readFileSync(_rlCachePath, 'utf8'));
+        }
+      } catch {}
+    }
+  }
+
+  // ── OMC / omc-lens Version Checks ─────────────────────────────────────
+  // Both answer from a 6-hour cache when they have one, which settles before
+  // even a zero-length deadline, so a stalled network still shows them.
+  const noVersion = { local: null, remote: null, updateAvailable: false, error: null };
+  const versions = await withDeadline(
+    Promise.all([
+      checkOmcVersion().catch(() => noVersion),
+      checkLensVersion().catch(() => noVersion),
+    ]),
+    netDeadline,
+  );
+  const [omcVersionCheck, lensVersionCheck] = versions === TIMED_OUT ? [noVersion, noVersion] : versions;
+  const omcUpdateAvailable = omcVersionCheck.updateAvailable ? omcVersionCheck.remote : null;
+  const lensUpdateAvailable = lensVersionCheck.updateAvailable ? lensVersionCheck.remote : null;
+  const lensVersion = lensVersionCheck.local || null;
+
+  // The stall mark is the negative cache for every fetch above. A lost race,
+  // or a phase that overran anyway (a slow Keychain read is synchronous and
+  // cannot be raced), sets it; only a phase that finished in time clears it.
+  if (!netStalled) {
+    if (rateLimitError !== 'timeout' && versions !== TIMED_OUT && Date.now() <= netDeadline) {
+      if (!_rlCacheHit) clearNetworkStalled();
+    } else {
+      markNetworkStalled();
+    }
+  }
 
   // ── Token Breakdown ────────────────────────────────────────────────────
   // Despite their names, neither stdin field is session-cumulative:
@@ -800,7 +1100,7 @@ export async function assembleContext(options = {}) {
   // slot objects there belong to the scan record's fold state, and adding the
   // subagent totals to them in place would double them on the next render.
   const costByModel = mergeByModel({}, stats.byModel);
-  mergeByModel(costByModel, scanSubagentUsage(transcriptPath));
+  mergeByModel(costByModel, subagentUsage);
   billUnknownAs(costByModel, model);
   const cost = calculateCostByModel(costByModel);
 
@@ -829,79 +1129,9 @@ export async function assembleContext(options = {}) {
   // Combined: running agents + OMC background (deduplicated via max)
   const activeTaskCount = Math.max(runningAgentCount, omcBackgroundCount);
 
-  // ── Rate Limits (throttled fetch + file-based cache) ───────────────────
-  // The usage API has its own rate limit — calling it every ~300ms render
-  // cycle quickly exhausts it. Only fetch when cache is stale (>60s).
-  let rateLimits = null;
-  let rateLimitError = undefined;
-  const _rlCachePath = join(tmpdir(), `omc-lens-ratelimit-cache-${stdin?.session_id || 'default'}.json`);
-  const _rlCacheTtlMs = 60 * 1000; // 60 seconds
-  let _rlCacheHit = false;
-  try {
-    if (existsSync(_rlCachePath)) {
-      const _rlStat = statSync(_rlCachePath);
-      const _rlAge = Date.now() - _rlStat.mtimeMs;
-      if (_rlAge < _rlCacheTtlMs) {
-        rateLimits = JSON.parse(readFileSync(_rlCachePath, 'utf8'));
-        _rlCacheHit = true;
-      }
-    }
-  } catch {}
-  if (!_rlCacheHit) {
-    try {
-      const usageResult = await getUsage();
-      rateLimits = usageResult.rateLimits || null;
-      rateLimitError = usageResult.error || undefined;
-    } catch {
-      rateLimitError = 'fetch_error';
-    }
-    // Model-scoped weekly windows (Fable/Sonnet/Opus). OMC still reads the
-    // legacy seven_day_<model> keys, which Anthropic now returns null for
-    // after moving those windows into the response's `limits` array, so it no
-    // longer produces these buckets. Fetch them separately and let anything
-    // OMC did produce win — an OMC release that learns `limits[]` then takes
-    // over silently, with no change needed here.
-    try {
-      const scoped = await getScopedWeeklyLimits();
-      if (scoped) rateLimits = { ...scoped, ...(rateLimits || {}) };
-    } catch {
-      // Scoped segments simply do not render.
-    }
-    if (rateLimits) {
-      try { writeFileSync(_rlCachePath, JSON.stringify(rateLimits), 'utf8'); } catch {}
-    }
-    // Fallback: read stale cache if fetch failed
-    if (!rateLimits) {
-      try {
-        if (existsSync(_rlCachePath)) {
-          rateLimits = JSON.parse(readFileSync(_rlCachePath, 'utf8'));
-        }
-      } catch {}
-    }
-  }
-
   // ── Git ────────────────────────────────────────────────────────────────
   const gitBranch = safeCall(() => getGitBranch(cwd), null);
   const gitStatus = safeCall(() => getGitStatusCounts(cwd), null);
-
-  // ── OMC Version Check ─────────────────────────────────────────────────
-  let omcVersionCheck = { local: null, remote: null, updateAvailable: false, error: null };
-  try {
-    omcVersionCheck = await checkOmcVersion();
-  } catch {
-    // Non-fatal — use defaults
-  }
-  const omcUpdateAvailable = omcVersionCheck.updateAvailable ? omcVersionCheck.remote : null;
-
-  // ── omc-lens Version Check ──────────────────────────────────────────
-  let lensVersionCheck = { local: null, remote: null, updateAvailable: false, error: null };
-  try {
-    lensVersionCheck = await checkLensVersion();
-  } catch {
-    // Non-fatal — use defaults
-  }
-  const lensUpdateAvailable = lensVersionCheck.updateAvailable ? lensVersionCheck.remote : null;
-  const lensVersion = lensVersionCheck.local || null;
 
   // ── Stdin extras (worktree, vim, session name) ────────────────────────
   const worktree = stdin?.worktree?.name || null;
@@ -948,6 +1178,9 @@ export async function assembleContext(options = {}) {
     worktree,
     vimMode,
     sessionName,
+    // Transcript-derived totals cover only part of the transcript this render;
+    // later renders resume the scan and fill them in.
+    scanPartial: scanBudget.cut,
   };
 }
 
